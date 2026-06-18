@@ -647,3 +647,95 @@ class RandARTransformer(nn.Module):
         reverse_permutation = torch.argsort(token_order, dim=-1).long().unsqueeze(-1).expand(-1, -1, 1)
         result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
         return result_indices
+
+    def generate_parallel(
+        self,
+        cond: torch.Tensor,
+        token_order: torch.Tensor,
+        cfg_scales: Tuple[float, float] = (1.0, 1.0),
+        num_inference_steps: int = 88,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ):
+        """ Same signature as generate, but decodes all tokens in a single parallel
+            forward pass (no KV cache, no iterative loop).
+
+            Returns:
+                result_indices: [bsz, block_size] sampled token indices in raster order
+                result_logits:  [bsz, block_size, vocab_size] logits in raster order
+        """
+        bs = cond.shape[0]
+
+        # Step-1: Generate token order
+        if token_order is None:
+            token_order = torch.arange(self.block_size, device=cond.device)
+            token_order = token_order.unsqueeze(0).repeat(bs, 1)
+            token_order = token_order.contiguous()
+            if self.position_order == "random":
+                for i in range(bs):
+                    token_order[i] = token_order[i][torch.randperm(self.block_size)]
+            token_order = token_order.contiguous()
+        else:
+            assert token_order.shape == (bs, self.block_size)
+
+        # Step-2: Prepare embeddings and freqs_cis
+        self.freqs_cis = self.freqs_cis.to(cond.device)
+        position_instruction_tokens = self.get_position_instruction_tokens(token_order)
+        img_token_freq_cis = self.freqs_cis[self.cls_token_num:].clone().to(token_order.device)[token_order]
+
+        # Step-3: Prepare CFG
+        use_cfg = cfg_scales[-1] > 1.0
+        if use_cfg:
+            cond_null = torch.ones_like(cond) * self.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+            img_token_freq_cis = torch.cat([img_token_freq_cis, img_token_freq_cis])
+            position_instruction_tokens = torch.cat([position_instruction_tokens, position_instruction_tokens])
+        else:
+            cond_combined = cond
+        cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
+        effective_bs = cond_combined_tokens.shape[0]
+
+        # Step-4: Single parallel forward pass — no KV cache
+        x = torch.cat([cond_combined_tokens, position_instruction_tokens], dim=1)
+        cur_freqs_cis = torch.cat([
+            self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(effective_bs, 1, 1, 1),
+            img_token_freq_cis,
+        ], dim=1)
+
+        # Temporarily disable KV caches so attention runs as plain causal (is_causal=True)
+        saved_caches = [layer.attention.kv_cache for layer in self.layers]
+        for layer in self.layers:
+            layer.attention.kv_cache = None
+
+        h = x
+        for layer in self.layers:
+            h = layer(h, cur_freqs_cis, start_pos=None, mask=None)
+        h = self.norm(h)
+        logits = self.output(h).float()
+
+        for layer, cache in zip(self.layers, saved_caches):
+            layer.attention.kv_cache = cache
+
+        # Step-5: Apply CFG with per-token linearly varying scale
+        token_logits = logits[:, self.cls_token_num:]  # [effective_bs, block_size, vocab_size]
+        if use_cfg:
+            cfg_scale_per_token = torch.linspace(cfg_scales[0], cfg_scales[-1], self.block_size, device=cond.device)
+            cfg_scale_per_token = cfg_scale_per_token.view(1, self.block_size, 1)
+            cond_logits, uncond_logits = torch.chunk(token_logits, 2, dim=0)
+            token_logits = uncond_logits + cfg_scale_per_token * (cond_logits - uncond_logits)
+
+        # Step-6: Sample tokens
+        result_indices = torch.zeros((bs, self.block_size), dtype=torch.long, device=cond.device)
+        for i in range(self.block_size):
+            result_indices[:, i:i+1] = sample(token_logits[:, i:i+1], temperature=temperature, top_k=top_k, top_p=top_p)[0]
+
+        # Step-7: Return to raster order
+        reverse_permutation = torch.argsort(token_order, dim=-1).long()
+        result_indices = torch.gather(result_indices, 1, reverse_permutation)
+        result_logits = torch.gather(
+            token_logits, 1,
+            reverse_permutation.unsqueeze(-1).expand(-1, -1, self.vocab_size),
+        )
+
+        return result_indices, result_logits
