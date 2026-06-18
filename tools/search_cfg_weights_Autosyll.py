@@ -106,6 +106,9 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
         entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # [bs, block_size]
         token_order = torch.argsort(entropy, dim=-1)  # [bs, block_size]
 
+        del parallel_logits, probs, entropy
+        torch.cuda.empty_cache()
+
         indices = gpt_model.generate(
             cond=c_indices,
             token_order=token_order,
