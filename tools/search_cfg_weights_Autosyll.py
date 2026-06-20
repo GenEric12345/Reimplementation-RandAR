@@ -63,7 +63,7 @@ def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
     avg_entropy = torch.stack(entropys).mean(dim = 0)
     token_order = torch.argsort(avg_entropy, dim=-1)  # [bs, block_size]
 
-    del logits, probs, enntropys
+    del entropys
     torch.cuda.empty_cache()
     return token_order
 
@@ -116,7 +116,7 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
         c_indices = torch.randint(0, args.num_classes, (args.per_proc_batch_size,), device=device)
         cfg_scales = (1.0, cfg_scale)
 
-        token_order = generate_ordering(c_indices, cfg_scales, 2, gpt_model, args)
+        token_order = generate_ordering(c_indices, cfg_scales, 8, gpt_model, args)
 
         indices = gpt_model.generate(
             cond=c_indices,
