@@ -48,7 +48,7 @@ def generate_ordering(c_indices, cfg_scales, gpt_model, args):
 
     entropy_sum = None
     for i in range(args.runs):
-        indices, logits = gpt_model.generate_with_logits(
+        indices, entropy = gpt_model.generate_with_entropy(
             cond=c_indices,
             token_order=None,
             cfg_scales=cfg_scales,
@@ -58,14 +58,12 @@ def generate_ordering(c_indices, cfg_scales, gpt_model, args):
             top_p=args.top_p,
         )
         # Lower entropy = higher confidence; sort ascending so confident positions go first
-        probs = torch.softmax(logits, dim=-1)
-        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # [bs, block_size]
         if entropy_sum is None:
             entropy_sum = entropy
         else:
             entropy_sum = entropy_sum + entropy
 
-        del indices, logits, probs, entropy
+        del indices, entropy
         torch.cuda.empty_cache()
 
     avg_entropy = entropy_sum/args.runs
