@@ -404,42 +404,34 @@ def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
     torch.cuda.empty_cache()
     return token_order
 
-
-def generate_frames(result_indices, token_order, tokenizer, num_frames, image_size_eval):
-    """Build num_frames partial images by revealing tokens in confidence order.
-
-    Args:
-        result_indices: [bs, block_size] final raster-order token indices
-        token_order:    [bs, block_size] raster positions sorted by confidence (ascending entropy)
-        tokenizer:      VQ decoder
-        num_frames:     number of frames to produce (0 → blank, num_frames-1 → full)
-        image_size_eval: decode resolution
-
-    Returns:
-        list of num_frames arrays, each [bs, H, W, 3] uint8
-    """
+def generate_masked_frames(result_indices, token_order, tokenizer, num_frames, image_size_eval):
     bs, block_size = result_indices.shape
+    grid_size = int(block_size ** 0.5)
+
+    full_images = tokenizer.decode_codes_to_img(result_indices, image_size_eval)
     frames = []
 
+    H = W = image_size_eval
+    patch_h = H // grid_size
+    patch_w = W // grid_size
+
     for frame_idx in range(num_frames):
-        if num_frames == 1:
-            num_visible = block_size
-        else:
-            num_visible = round(frame_idx * block_size / (num_frames - 1))
+        num_visible = round(frame_idx * block_size / (num_frames - 1))
 
-        partial_indices = torch.zeros_like(result_indices)
-
+        mask_tokens = torch.zeros(bs, block_size, device=result_indices.device, dtype=torch.bool)
         if num_visible > 0:
-            # raster positions of the num_visible most confident tokens
-            positions = token_order[:, :num_visible]          # [bs, num_visible]
-            values = torch.gather(result_indices, 1, positions)  # [bs, num_visible]
-            partial_indices.scatter_(1, positions, values)
+            positions = token_order[:, :num_visible]
+            mask_tokens.scatter_(1, positions, True)
 
-        frame_images = tokenizer.decode_codes_to_img(partial_indices, image_size_eval)
-        frames.append(frame_images)
+        mask_grid = mask_tokens.view(bs, grid_size, grid_size)
+        mask_pixels = mask_grid.repeat_interleave(patch_h, dim=1).repeat_interleave(patch_w, dim=2)
+        mask_pixels = mask_pixels[..., None].cpu().numpy()
+
+        frame = full_images.copy()
+        frame = frame * mask_pixels  # unrevealed regions black
+        frames.append(frame.astype("uint8"))
 
     return frames
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -550,7 +542,7 @@ def main(args):
 
         # Step 3: Build visualization frames
         print(f"  Rendering {args.num_frames} frames...")
-        frames = generate_frames(
+        frames = generate_masked_frames(
             result_indices, token_order, tokenizer, args.num_frames, args.image_size_eval
         )
 
