@@ -43,9 +43,10 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
     return npz_path
 
+@torch.inference_mode()
 def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
 
-    entropys = []
+    entropy_sum = None
     for i in range(runs):
         indices, logits = gpt_model.generate_with_logits(
             cond=c_indices,
@@ -59,12 +60,17 @@ def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
         # Lower entropy = higher confidence; sort ascending so confident positions go first
         probs = torch.softmax(logits, dim=-1)
         entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # [bs, block_size]
-        entropys.append(entropy)
-    avg_entropy = torch.stack(entropys).mean(dim = 0)
+        if entropy_sum is None:
+            entropy_sum = entropy
+        else:
+            entropy_sum = entropy_sum + entropy
+
+        del indices, logits, probs, entropy
+        torch.cuda.empty_cache()
+
+    avg_entropy = entropy_sum/runs
     token_order = torch.argsort(avg_entropy, dim=-1)  # [bs, block_size]
 
-    del entropys
-    torch.cuda.empty_cache()
     return token_order
 
 
