@@ -156,18 +156,6 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       width: 100%; height: 100%;
       cursor: crosshair;
     }
-    #attn-hint {
-      position: absolute;
-      bottom: 4px; left: 50%;
-      transform: translateX(-50%);
-      font-size: 0.65rem;
-      color: #aaa;
-      background: rgba(0,0,0,0.55);
-      padding: 2px 8px;
-      border-radius: 8px;
-      pointer-events: none;
-      white-space: nowrap;
-    }
     .notes-panel {
       flex: 1;
       display: flex;
@@ -181,7 +169,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       text-transform: uppercase;
       letter-spacing: 0.08em;
     }
-    #attn-info {
+    #entropy-info {
       background: #12182e;
       border: 1px solid #1e3a6e;
       border-radius: 6px;
@@ -189,10 +177,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       font-size: 0.82rem;
       line-height: 1.5;
       color: #aaa;
-      min-height: 60px;
       white-space: pre-wrap;
     }
-    #attn-info.active { color: #e0e0e0; border-color: #e9456066; }
+    #entropy-info.active { color: #e0e0e0; border-color: #e9456066; }
     .notes-text {
       flex: 1;
       min-height: 240px;
@@ -295,11 +282,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
             <img id="main-image" src="" alt="Generated image">
             <canvas id="attn-canvas"></canvas>
             <div id="click-overlay"></div>
-            <div id="attn-hint">Click a revealed token to see its attention</div>
           </div>
           <div class="notes-panel">
-            <div class="notes-label">Attention Info</div>
-            <div id="attn-info">Click a revealed token on the image to view its attention heatmap over the context.</div>
+            <div class="notes-label">Token Entropy</div>
+            <div id="entropy-info">—</div>
             <div class="notes-label" style="margin-top:8px">Notes</div>
             <pre class="notes-text">- Image generated in confidence order
 - Causal attention on previously generated tokens
@@ -341,7 +327,8 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     let selectedId = 0;
     let playing = false;
     let playTimer = null;
-    let attnCache = {};  // imgId -> {attn: [[...]]}
+    let attnCache = {};    // imgId -> {attn: [[...]]}
+    let entropyCache = {}; // imgId -> {entropy: [...]}
     let currentAttnGenStep = -1;
 
     const GRID = 16;
@@ -360,9 +347,32 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       const canvas = document.getElementById('attn-canvas');
       canvas.style.display = 'none';
       currentAttnGenStep = -1;
-      document.getElementById('attn-info').className = 'attn-info';
-      document.getElementById('attn-info').textContent =
-        'Click a revealed token on the image to view its attention heatmap over the context.';
+    }
+
+    async function showEntropy(rasterPos) {
+      const img = meta.images[selectedId];
+      if (!entropyCache[selectedId]) {
+        try {
+          const r = await fetch('images/' + pad(img.id, 4) + '/entropy.json');
+          entropyCache[selectedId] = await r.json();
+        } catch (e) {
+          return;
+        }
+      }
+      const entropy = entropyCache[selectedId].entropy[rasterPos];
+      const genStep = img.token_order.indexOf(rasterPos);
+      const row = Math.floor(rasterPos / GRID);
+      const col = rasterPos % GRID;
+      const el = document.getElementById('entropy-info');
+      el.className = 'active';
+      el.textContent =
+        'Token #' + genStep + ' | Patch (' + row + ', ' + col + ')\nEntropy: ' + entropy.toFixed(4);
+    }
+
+    function clearEntropy() {
+      const el = document.getElementById('entropy-info');
+      el.className = '';
+      el.textContent = '—';
     }
 
     function renderHeatmap(attnValues, tokenOrder, clickedGenStep) {
@@ -420,9 +430,6 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       // Gen step 0 has no context
       if (genStep === 0) {
-        document.getElementById('attn-info').className = 'attn-info active';
-        document.getElementById('attn-info').textContent =
-          'Token #' + genStep + ' (raster ' + rasterPos + ') was the first generated — no image context to attend to.';
         clearHeatmap();
         return;
       }
@@ -441,22 +448,6 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       const attnValues = attnCache[selectedId].attn[genStep]; // length = genStep
 
       renderHeatmap(attnValues, tokenOrder, genStep);
-
-      // Summarize: top-3 context patches by attention weight
-      const indexed = attnValues.map((v, j) => [v, j]);
-      indexed.sort((a, b) => b[0] - a[0]);
-      const topK = indexed.slice(0, 3).map(([v, j]) => {
-        const rp = tokenOrder[j];
-        return 'patch (' + Math.floor(rp / GRID) + ',' + (rp % GRID) + ') ' + (v * 100).toFixed(1) + '%';
-      });
-
-      const el = document.getElementById('attn-info');
-      el.className = 'attn-info active';
-      el.textContent =
-        'Token #' + genStep + ' @ raster ' + rasterPos +
-        ' (row ' + Math.floor(rasterPos / GRID) + ', col ' + (rasterPos % GRID) + ')\n' +
-        'Context size: ' + attnValues.length + ' tokens\n' +
-        'Top context: ' + topK.join(' | ');
     }
 
     // ── Click handler on the image overlay
@@ -471,6 +462,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         const row = Math.floor(y / rect.height * GRID);
         const rasterPos = row * GRID + col;
         showAttentionForToken(rasterPos);
+        showEntropy(rasterPos);
       });
 
       document.getElementById('btn-clear-attn').addEventListener('click', clearHeatmap);
@@ -528,7 +520,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     function selectImage(id) {
       selectedId = id;
       clearHeatmap();
-      attnCache = {};  // evict cache when switching images (memory)
+      clearEntropy();
+      attnCache = {};     // evict cache when switching images (memory)
+      entropyCache = {};
       document.querySelectorAll('.thumb').forEach(t => t.classList.remove('active'));
       const el = document.querySelector('.thumb[data-id="' + id + '"]');
       if (el) { el.classList.add('active'); el.scrollIntoView({ block: 'nearest' }); }
@@ -562,6 +556,14 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       // If the currently shown heatmap token is no longer revealed, clear it
       if (currentAttnGenStep >= 0 && currentAttnGenStep >= numVis) {
         clearHeatmap();
+      }
+
+      // Update entropy display: show the last revealed token
+      if (numVis > 0) {
+        const lastRasterPos = meta.images[selectedId].token_order[numVis - 1];
+        showEntropy(lastRasterPos);
+      } else {
+        clearEntropy();
       }
     }
 
@@ -667,7 +669,7 @@ def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
     token_order = torch.argsort(avg_entropy, dim=-1)  # ascending: confident first
     del entropys
     torch.cuda.empty_cache()
-    return token_order
+    return token_order, avg_entropy
 
 def generate_masked_frames(result_indices, token_order, tokenizer, num_frames, image_size_eval):
     bs, block_size = result_indices.shape
@@ -790,7 +792,7 @@ def main(args):
 
         # Step 1: Confidence-based token ordering (from Autosyll)
         print(f"  Computing token ordering ({args.ordering_runs} runs)...")
-        token_order = generate_ordering(
+        token_order, avg_entropy = generate_ordering(
             c_indices, cfg_scales, args.ordering_runs, gpt_model, args
         )
 
@@ -837,6 +839,13 @@ def main(args):
             }
             with open(os.path.join(img_dir, "attention.json"), "w") as f:
                 json.dump(attn_data, f)
+
+            # Entropy data: entropy[raster_pos] = float (avg entropy over ordering runs)
+            entropy_data = {
+                "entropy": avg_entropy[local_idx].tolist()
+            }
+            with open(os.path.join(img_dir, "entropy.json"), "w") as f:
+                json.dump(entropy_data, f)
 
             metadata["images"].append(
                 {
