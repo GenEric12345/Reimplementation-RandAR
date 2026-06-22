@@ -105,12 +105,12 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     .main {
       flex: 1;
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: center;
       padding: 24px;
       overflow: auto;
     }
-    .viewer { display: flex; flex-direction: column; align-items: center; gap: 14px; max-width: 520px; width: 100%; }
+    .viewer { display: flex; flex-direction: column; align-items: center; gap: 14px; width: 100%; max-width: 900px; }
     .class-badge {
       font-size: 0.95rem;
       font-weight: 600;
@@ -121,15 +121,48 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       padding: 4px 16px;
       letter-spacing: 0.03em;
     }
-    #main-image {
+    .image-row {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
       width: 100%;
-      max-width: 480px;
-      aspect-ratio: 1;
+    }
+    #main-image {
+      width: 360px;
+      height: 360px;
+      flex-shrink: 0;
       border-radius: 8px;
       border: 2px solid #1e3a6e;
       image-rendering: pixelated;
       background: #111;
       display: block;
+    }
+    .notes-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 0;
+    }
+    .notes-label {
+      font-size: 0.72rem;
+      color: #778;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .notes-text {
+      flex: 1;
+      min-height: 330px;
+      background: #12182e;
+      border: 1px solid #1e3a6e;
+      border-radius: 6px;
+      padding: 10px 12px;
+      color: #e0e0e0;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 0.85rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      margin: 0;
     }
     .controls { width: 100%; }
     .slider-labels { display: flex; justify-content: space-between; font-size: 0.7rem; color: #556; margin-bottom: 6px; }
@@ -166,10 +199,24 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     .stats-row {
       display: flex;
       justify-content: space-between;
+      align-items: center;
       font-size: 0.8rem;
       color: #778;
       margin-top: 6px;
     }
+    .token-jump-wrap { display: flex; align-items: center; gap: 4px; }
+    #token-jump {
+      width: 54px;
+      background: #1a2040;
+      border: 1px solid #334;
+      border-radius: 4px;
+      color: #ccc;
+      font-size: 0.8rem;
+      padding: 2px 6px;
+      text-align: right;
+      outline: none;
+    }
+    #token-jump:focus { border-color: #e94560; color: #fff; }
     .btn-row { display: flex; gap: 8px; margin-top: 10px; }
     .btn {
       padding: 6px 14px;
@@ -200,19 +247,32 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="loading">Loading metadata...</div>
       <div class="viewer" id="viewer" style="display:none">
         <div class="class-badge" id="class-badge">Class —</div>
-        <img id="main-image" src="" alt="Generated image">
+        <div class="image-row">
+          <img id="main-image" src="" alt="Generated image">
+          <div class="notes-panel">
+            <div class="notes-label">Notes / Description</div>
+            <pre class="notes-text">
+            - The image shown is generated in confidence order (not necessarily in 256 steps)
+            - It is generated with strictly causal attention on previously generated tokens (starting with just the class ID) 
+            </pre>
+          </div>
+        </div>
         <div class="controls">
           <div class="slider-labels">
-            <span>← Empty</span>
-            <span>Full →</span>
+            <span>← Empty (0 tokens)</span>
+            <span>Full (256 tokens) →</span>
           </div>
-          <input type="range" id="frame-slider" min="0" max="31" value="31">
+          <input type="range" id="frame-slider" min="0" max="256" value="256">
           <div class="progress-bar">
             <div class="progress-fill" id="progress-fill" style="width:100%"></div>
           </div>
           <div class="stats-row">
-            <span id="token-count">256 / 256 tokens</span>
-            <span id="conf-label">Confidence step: 31 / 31</span>
+            <span id="token-count">256 / 256 tokens revealed</span>
+            <div class="token-jump-wrap">
+              <span>Jump to token:</span>
+              <input type="number" id="token-jump" min="0" max="256" value="256">
+              <span id="token-jump-max">/ 256</span>
+            </div>
           </div>
           <div class="btn-row">
             <button class="btn" id="btn-play">&#9654; Play</button>
@@ -246,12 +306,16 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         'cfg=' + meta.cfg_scale +
         '  |  steps=' + meta.num_inference_steps +
         '  |  ordering_runs=' + meta.ordering_runs +
-        '  |  frames=' + meta.num_frames +
         '  |  block_size=' + meta.block_size;
 
+      const maxFrame = meta.num_frames - 1;
       const slider = document.getElementById('frame-slider');
-      slider.max = meta.num_frames - 1;
-      slider.value = meta.num_frames - 1;
+      slider.max = maxFrame;
+      slider.value = maxFrame;
+      const jump = document.getElementById('token-jump');
+      jump.max = maxFrame;
+      jump.value = maxFrame;
+      document.getElementById('token-jump-max').textContent = '/ ' + maxFrame;
 
       buildThumbs();
       document.getElementById('loading').style.display = 'none';
@@ -290,8 +354,11 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     function updateFrame(f) {
+      const maxFrame = meta.num_frames - 1;
+      f = Math.max(0, Math.min(f, maxFrame));
       const slider = document.getElementById('frame-slider');
       slider.value = f;
+      document.getElementById('token-jump').value = f;
 
       const img = meta.images[selectedId];
       const src = 'images/' + pad(img.id, 4) + '/frames/' + pad(f, 4) + '.png';
@@ -300,16 +367,22 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       const numVis = (meta.num_frames > 1)
         ? Math.round(f * meta.block_size / (meta.num_frames - 1))
         : meta.block_size;
-      const pct = (f / (meta.num_frames - 1) * 100).toFixed(1);
+      const pct = (maxFrame > 0) ? (f / maxFrame * 100).toFixed(1) : 100;
       document.getElementById('token-count').textContent =
-        numVis + ' / ' + meta.block_size + ' tokens';
-      document.getElementById('conf-label').textContent =
-        'Confidence step: ' + f + ' / ' + (meta.num_frames - 1);
+        numVis + ' / ' + meta.block_size + ' tokens revealed';
       document.getElementById('progress-fill').style.width = pct + '%';
     }
 
     document.getElementById('frame-slider').addEventListener('input', e => {
       updateFrame(parseInt(e.target.value));
+    });
+
+    document.getElementById('token-jump').addEventListener('change', e => {
+      const v = parseInt(e.target.value);
+      if (!isNaN(v)) updateFrame(v);
+    });
+    document.getElementById('token-jump').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); updateFrame(parseInt(e.target.value)); }
     });
 
     document.getElementById('btn-prev').addEventListener('click', () => {
@@ -354,9 +427,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     });
 
-    // Keyboard shortcuts
+    // Keyboard shortcuts — disabled when focus is in textarea or jump input
     document.addEventListener('keydown', e => {
       if (!meta) return;
+      if (e.target.tagName === 'TEXTAREA' || e.target.id === 'token-jump') return;
       const slider = document.getElementById('frame-slider');
       const v = parseInt(slider.value);
       if (e.key === 'ArrowRight') { if (v < meta.num_frames - 1) updateFrame(v + 1); }
@@ -386,7 +460,7 @@ def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
     """
     entropys = []
     for _ in range(runs):
-        indices, logits = gpt_model.generate_with_logits(
+        indices, entropy = gpt_model.generate_with_entropy(
             cond=c_indices,
             token_order=None,
             cfg_scales=cfg_scales,
@@ -395,8 +469,6 @@ def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
             top_k=args.top_k,
             top_p=args.top_p,
         )
-        probs = torch.softmax(logits, dim=-1)
-        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # [bs, block_size]
         entropys.append(entropy)
     avg_entropy = torch.stack(entropys).mean(dim=0)
     token_order = torch.argsort(avg_entropy, dim=-1)  # ascending: confident first
@@ -468,6 +540,7 @@ def main(args):
     gpt_model.eval()
 
     block_size = gpt_model.block_size
+    num_frames = block_size + 1  # one frame per token (0 through block_size tokens revealed)
 
     # Determine class labels
     if args.class_labels:
@@ -498,7 +571,7 @@ def main(args):
         "exp_name": args.exp_name,
         "ckpt": ckpt_string_name,
         "cfg_scale": args.cfg_scale,
-        "num_frames": args.num_frames,
+        "num_frames": num_frames,
         "block_size": block_size,
         "image_size_eval": args.image_size_eval,
         "num_inference_steps": args.num_inference_steps,
@@ -541,9 +614,9 @@ def main(args):
         )
 
         # Step 3: Build visualization frames
-        print(f"  Rendering {args.num_frames} frames...")
+        print(f"  Rendering {num_frames} frames...")
         frames = generate_masked_frames(
-            result_indices, token_order, tokenizer, args.num_frames, args.image_size_eval
+            result_indices, token_order, tokenizer, num_frames, args.image_size_eval
         )
 
         # Step 4: Save to disk
@@ -627,10 +700,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Images per GPU forward pass (default: 1)")
     parser.add_argument("--global-seed", type=int, default=0)
-
-    # Visualization
-    parser.add_argument("--num-frames", type=int, default=32,
-                        help="Number of confidence-ordered frames to save per image (default: 32)")
 
     # Output
     parser.add_argument("--exp-name", type=str, default="randar",
