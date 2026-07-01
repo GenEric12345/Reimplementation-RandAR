@@ -43,34 +43,6 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
     return npz_path
 
-@torch.inference_mode()
-def generate_ordering(c_indices, cfg_scales, gpt_model, args):
-
-    entropy_sum = None
-    for i in range(args.runs):
-        indices, entropy = gpt_model.generate_with_entropy(
-            cond=c_indices,
-            token_order=None,
-            cfg_scales=cfg_scales,
-            num_inference_steps=args.num_inference_steps,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-        )
-        # Lower entropy = higher confidence; sort ascending so confident positions go first
-        if entropy_sum is None:
-            entropy_sum = entropy
-        else:
-            entropy_sum = entropy_sum + entropy
-
-        del indices, entropy
-        torch.cuda.empty_cache()
-
-    avg_entropy = entropy_sum/args.runs
-    token_order = torch.argsort(avg_entropy, dim=-1)  # [bs, block_size]
-
-    return token_order
-
 
 def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples):
     # Setup DDP:
@@ -114,17 +86,15 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
     torch.manual_seed(seed)
 
     global_batch_size = args.per_proc_batch_size * dist.get_world_size()
-
+    
     cur_iter = 0
     for _ in pbar:
         c_indices = torch.randint(0, args.num_classes, (args.per_proc_batch_size,), device=device)
         cfg_scales = (1.0, cfg_scale)
-
-        token_order = generate_ordering(c_indices, cfg_scales, gpt_model, args)
-
+    
         indices = gpt_model.generate(
             cond=c_indices,
-            token_order=token_order,
+            token_order=None,
             cfg_scales=cfg_scales,
             num_inference_steps=args.num_inference_steps,
             temperature=args.temperature,
@@ -133,7 +103,7 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
         )
 
         samples = tokenizer.decode_codes_to_img(indices, args.image_size_eval)
-
+    
         for i, sample in enumerate(samples):
             index = i * dist.get_world_size() + rank + total
             Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
@@ -210,7 +180,7 @@ def main(args):
 
     dist.barrier()
     dist.destroy_process_group()
-
+    
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(args.num_fid_samples_search / global_batch_size) * global_batch_size)
 
@@ -240,13 +210,13 @@ def main(args):
 
         with open(result_file_name, "w") as f:
             json.dump(eval_results, f)
-
+    
     # report the results
     total_samples = int(math.ceil(args.num_fid_samples_report / global_batch_size) * global_batch_size)
     optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
     fid, sfid, IS, precision, recall = sample_and_eval(
         tokenizer, gpt_model, optimal_cfg_scale, args, device, total_samples)
-
+    
     print(f"Optimal CFG scale: {optimal_cfg_scale:.2f}")
     print(f"Eval results for optimal CFG scale: {fid, sfid, IS, precision, recall}")
     eval_results[f"{optimal_cfg_scale:.2f}-report"] = {
@@ -289,7 +259,6 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--ref-path", type=str, default="/tmp/VIRTUAL_imagenet256_labeled.npz")
-    parser.add_argument("--runs", type=int, default=8)
     # output results
     parser.add_argument("--results-path", type=str, default="./results")
     args = parser.parse_args()
