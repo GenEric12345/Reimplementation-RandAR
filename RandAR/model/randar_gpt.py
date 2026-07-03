@@ -1005,6 +1005,284 @@ class RandARTransformer(nn.Module):
         # Step 6: result_indices already in raster order  [CHANGE: no argsort/gather needed]
         return result_indices
 
+    def generate_beam(
+        self,
+        cond: torch.Tensor,
+        token_order: torch.Tensor,
+        beam_size: int = 4,
+        num_branches: Optional[int] = None,
+        cfg_scales: Tuple[float, float] = (1.0, 1.0),
+        num_inference_steps: int = 88,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ):
+        """Beam search over which positions to decode next, layered on top of the
+        same confidence-driven position selection used by generate_confidence_first.
+
+        At each parallel-decoding step, probe_and_select_chunks() ranks all unfilled
+        raster positions by entropy (one cache-free forward pass per beam over
+        [committed_ctx, all_pos_instrs], exactly like generate_confidence_first's
+        probe_and_select) and proposes num_branches chunk options per beam: option 0
+        is the lowest-entropy group of m positions (the same choice
+        generate_confidence_first would make), and option i>0 swaps exactly slot
+        i-1 of that group for the next-best unfilled candidate.
+
+        Unlike the probe pass, each (beam, option) candidate is then scored with its
+        own real commit forward pass -- batched but still one full forward per
+        candidate, no KV cache -- over just [committed_ctx, chosen_chunk_query_
+        tokens_in_rank_order]. This mirrors the causal structure that
+        generate_confidence_first's KV-cached commit step produces (a chunk's query
+        tokens only ever attend to already-committed content and to each other, in
+        rank order -- never to other unfilled raster positions), so branches are
+        compared on genuinely-computed logits rather than the probe's approximate
+        ones. Tokens are sampled per candidate and their log-probs accumulate into
+        that beam's running score. After scoring, only the top beam_size (beam,
+        option) pairs per image survive to the next step.
+
+        token_order is ignored (positions are chosen by confidence, like
+        generate_confidence_first).
+
+        Returns:
+            result_indices: [bsz, block_size] tokens of the best-scoring beam per
+                            image, in raster order.
+        """
+        O = cond.shape[0]  # original batch size
+        B = beam_size
+        num_branches = num_branches if num_branches is not None else beam_size
+        use_cfg = cfg_scales[-1] > 1.0
+        D = 2 if use_cfg else 1
+
+        # generate_beam never calls setup_caches (branching/pruning would require
+        # re-indexing a KV cache, which we're deliberately avoiding) -- so any cache
+        # left behind by a previous generate()/generate_confidence_first() call on
+        # this model must be disabled for the duration, then restored.
+        saved_caches = [l.attention.kv_cache for l in self.layers]
+        for l in self.layers:
+            l.attention.kv_cache = None
+
+        # ------------------------------------------------------------------ #
+        # Step-1: all-raster pos_instrs / freqs, expanded across the beam dim. #
+        # Content is identical across beams (positions don't depend on beam),  #
+        # only which subset each beam later selects differs.                  #
+        # ------------------------------------------------------------------ #
+        raster_order   = torch.arange(self.block_size, device=cond.device).unsqueeze(0).repeat(O * B, 1)
+        all_pos_instrs = self.get_position_instruction_tokens(raster_order)              # [O*B, block_size, dim]
+        all_img_freqs  = (self.freqs_cis[self.cls_token_num:]
+                          .clone().to(cond.device)
+                          .unsqueeze(0).repeat(O * B, 1, 1, 1))                          # [O*B, block_size, h/2, 2]
+
+        result_indices = torch.zeros((O, B, self.block_size), dtype=torch.long, device=cond.device)
+        filled_mask    = torch.zeros((O, B, self.block_size), dtype=torch.bool, device=cond.device)
+        beam_logprob   = torch.zeros((O, B), dtype=torch.float32, device=cond.device)
+
+        # Step-2: Prepare CFG  [SAME idea AS generate_confidence_first, applied after beam expansion]
+        cond_beam = cond.repeat_interleave(B, dim=0)                                     # [O*B, ...] image-major, beam-minor
+        if use_cfg:
+            cond_null      = torch.ones_like(cond_beam) * self.num_classes
+            cond_combined  = torch.cat([cond_beam, cond_null])
+            all_img_freqs  = torch.cat([all_img_freqs,  all_img_freqs],  dim=0)
+            all_pos_instrs = torch.cat([all_pos_instrs, all_pos_instrs], dim=0)
+        else:
+            cond_combined = cond_beam
+        cond_combined_tokens = self.cls_embedding(cond_combined, train=False)            # [O*B*D, cls_token_num, dim]
+
+        freq_h, freq_w = self.freqs_cis.shape[-2], self.freqs_cis.shape[-1]
+
+        # committed_ctx / committed_freqs: full sequence built so far for every
+        # (image, beam) pair, CFG-doubled. No KV cache -- every step replays this
+        # whole sequence from scratch, which is what keeps branching/pruning simple.
+        committed_ctx   = cond_combined_tokens
+        committed_freqs = self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(O * B * D, 1, 1, 1)
+
+        def gather_pos(flat_sel, pos_bank):
+            # flat_sel: [n, m] raster indices, pos_bank: [n, block_size, dim] -> [n, m, dim]
+            return torch.gather(pos_bank, 1, flat_sel.unsqueeze(-1).expand(-1, -1, self.dim))
+
+        def gather_freq(flat_sel, freq_bank):
+            return torch.gather(freq_bank, 1,
+                                flat_sel.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, freq_h, freq_w))
+
+        def expand_for_options(bank, n_opt):
+            # bank: [O*B*D, ...] -> [O*B*n_opt*D, ...], preserving the (cond-block,
+            # uncond-block) split and (image, beam)-major / option-minor ordering.
+            if use_cfg:
+                cond_bank, uncond_bank = bank.chunk(2, dim=0)
+                return torch.cat([cond_bank.repeat_interleave(n_opt, dim=0),
+                                  uncond_bank.repeat_interleave(n_opt, dim=0)], dim=0)
+            return bank.repeat_interleave(n_opt, dim=0)
+
+        def regather_beams(bank, parent_flat):
+            # bank: [O*B*D, ...] -> reordered/duplicated to the O*B surviving rows
+            if use_cfg:
+                cond_bank, uncond_bank = bank.chunk(2, dim=0)
+                return torch.cat([cond_bank[parent_flat], uncond_bank[parent_flat]], dim=0)
+            return bank[parent_flat]
+
+        # ------------------------------------------------------------------ #
+        # probe_and_select_chunks: one cache-free forward pass per beam over    #
+        # [committed_ctx, all_pos_instrs] to rank unfilled positions by entropy #
+        # (same heuristic generate_confidence_first's probe uses for ranking   #
+        # only, never for final logits). Builds num_branches candidate chunks: #
+        # option 0 is the base lowest-entropy group of m positions; option i>0 #
+        # swaps slot i-1 of that group for the next-best unused candidate.     #
+        #                                                                      #
+        # Returns sel: [O, B, n_opt, m] raster indices.                        #
+        # ------------------------------------------------------------------ #
+        def probe_and_select_chunks(m: int, step_progress: int, n_opt: int) -> torch.Tensor:
+            probe_x     = torch.cat([committed_ctx,   all_pos_instrs], dim=1)
+            probe_freqs = torch.cat([committed_freqs, all_img_freqs],  dim=1)
+
+            h = probe_x
+            for layer in self.layers:
+                h = layer(h, probe_freqs, start_pos=None, mask=None)
+            h = self.norm(h)
+            probe_logits = self.output(h).float()[:, -self.block_size:]  # [O*B*D, block_size, vocab]
+
+            if use_cfg:
+                cur_cfg = (cfg_scales[0]
+                           + (cfg_scales[-1] - cfg_scales[0]) * step_progress / self.block_size)
+                cond_log, uncond_log = torch.chunk(probe_logits, 2, dim=0)
+                ent_logits = uncond_log + cur_cfg * (cond_log - uncond_log)  # [O*B, block_size, vocab]
+            else:
+                ent_logits = probe_logits
+
+            probs   = torch.softmax(ent_logits, dim=-1)
+            entropy = -(probs * torch.log(probs.clamp(min=1e-10))).sum(dim=-1)  # [O*B, block_size]
+            entropy = entropy.view(O, B, self.block_size).masked_fill(filled_mask, float('inf'))
+
+            n_total = m + n_opt - 1
+            _, idx_topk = torch.topk(entropy, n_total, dim=-1, largest=False)           # [O, B, n_total]
+            vals_topk   = torch.gather(entropy, -1, idx_topk)
+            ranked      = torch.gather(idx_topk, -1, torch.argsort(vals_topk, dim=-1))  # ascending entropy
+
+            base  = ranked[..., :m]  # [O, B, m]
+            extra = ranked[..., m:]  # [O, B, n_opt - 1]
+
+            sel = base.unsqueeze(2).repeat(1, 1, n_opt, 1).clone()  # [O, B, n_opt, m]
+            for i in range(1, n_opt):
+                sel[:, :, i, i - 1] = extra[:, :, i - 1]
+            return sel
+
+        # Step-5: parallel decoding schedule  [SAME AS generate_confidence_first]
+        if num_inference_steps == -1:
+            num_inference_steps = self.block_size
+
+        cur_inference_step       = 0
+        num_query_token_cur_step = 1
+        query_token_idx_cur_step = 0
+
+        while (query_token_idx_cur_step <= self.block_size - num_query_token_cur_step
+               and query_token_idx_cur_step <= self.block_size - 1):
+
+            k = query_token_idx_cur_step
+            m = num_query_token_cur_step
+
+            # clamp branching factor if too few unfilled positions remain for extra candidates
+            n_opt = max(1, min(num_branches, self.block_size - k - m + 1))
+
+            sel = probe_and_select_chunks(m, k, n_opt)  # [O, B, n_opt, m]
+            sel_flat = sel.view(O * B * n_opt, m)       # (image, beam, option)-major
+
+            # ------------------------------------------------------------------ #
+            # Real commit forward per (beam, option): batch = O*B*n_opt*D, over   #
+            # [committed_ctx repeated per option, chosen chunk's query tokens in   #
+            # rank order]. This mirrors the causal structure of                   #
+            # generate_confidence_first's KV-cached commit step, just recomputed   #
+            # from scratch each step instead of incrementally cached.             #
+            # ------------------------------------------------------------------ #
+            sel_flat_d  = torch.cat([sel_flat, sel_flat], dim=0) if use_cfg else sel_flat  # [O*B*n_opt*D, m]
+            chunk_pos   = gather_pos(sel_flat_d, expand_for_options(all_pos_instrs, n_opt))
+            chunk_freqs = gather_freq(sel_flat_d, expand_for_options(all_img_freqs, n_opt))
+
+            commit_x     = torch.cat([expand_for_options(committed_ctx, n_opt),   chunk_pos],   dim=1)
+            commit_freqs = torch.cat([expand_for_options(committed_freqs, n_opt), chunk_freqs], dim=1)
+
+            h = commit_x
+            for layer in self.layers:
+                h = layer(h, commit_freqs, start_pos=None, mask=None)
+            h = self.norm(h)
+            commit_logits = self.output(h).float()[:, -m:]  # [O*B*n_opt*D, m, vocab]
+
+            if use_cfg:
+                cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * k / self.block_size
+                cond_logits, uncond_logits = torch.chunk(commit_logits, 2, dim=0)
+                commit_logits = uncond_logits + cur_cfg_scale * (cond_logits - uncond_logits)  # [O*B*n_opt, m, vocab]
+
+            # sample each of the m chunk positions per candidate and accumulate log-probs
+            n_cand        = O * B * n_opt
+            indices       = torch.zeros(n_cand, m, dtype=torch.long, device=cond.device)
+            chunk_logprob = torch.zeros(n_cand, device=cond.device)
+            for i in range(m):
+                idx_i, probs_i = sample(commit_logits[:, i:i+1], temperature=temperature, top_k=top_k, top_p=top_p)
+                indices[:, i:i+1] = idx_i
+                chunk_logprob += torch.log(torch.gather(probs_i, 1, idx_i).clamp(min=1e-10)).squeeze(-1)
+
+            # ------------------------------------------------------------------ #
+            # Prune: per image, keep the top beam_size (beam, option) candidates   #
+            # by cumulative log-prob.                                             #
+            # ------------------------------------------------------------------ #
+            cand_logprob = beam_logprob.unsqueeze(-1).repeat(1, 1, n_opt).view(O, B * n_opt) \
+                           + chunk_logprob.view(O, B * n_opt)
+
+            keep_vals, keep_idx = torch.topk(cand_logprob, B, dim=1, largest=True)  # [O, B]
+            parent_beam   = keep_idx // n_opt  # [O, B] which OLD beam (0..B-1) each survivor came from
+            # (chosen_option = keep_idx % n_opt is implicit in the gathers below)
+
+            sel_o   = sel.view(O, B * n_opt, m)      # [O, B*n_opt, m]
+            idx_o   = indices.view(O, B * n_opt, m)  # [O, B*n_opt, m]
+            new_sel = torch.gather(sel_o, 1, keep_idx.unsqueeze(-1).expand(-1, -1, m))  # [O, B, m]
+            new_tok = torch.gather(idx_o, 1, keep_idx.unsqueeze(-1).expand(-1, -1, m))  # [O, B, m]
+
+            # rebuild per-beam state from the surviving parents, then record this step's chunk
+            result_indices = torch.gather(result_indices, 1,
+                                          parent_beam.unsqueeze(-1).expand(-1, -1, self.block_size)).clone()
+            filled_mask    = torch.gather(filled_mask, 1,
+                                          parent_beam.unsqueeze(-1).expand(-1, -1, self.block_size)).clone()
+            result_indices.scatter_(2, new_sel, new_tok)
+            filled_mask.scatter_(2, new_sel, True)
+            beam_logprob = keep_vals
+
+            # rebuild committed_ctx / committed_freqs for surviving beams, then append this chunk
+            parent_flat = (torch.arange(O, device=cond.device).unsqueeze(1) * B + parent_beam).view(-1)  # [O*B]
+            committed_ctx   = regather_beams(committed_ctx,   parent_flat)
+            committed_freqs = regather_beams(committed_freqs, parent_flat)
+
+            new_sel_flat   = new_sel.view(O * B, m)
+            new_tok_flat   = new_tok.view(O * B, m)
+            new_sel_flat_d = torch.cat([new_sel_flat, new_sel_flat], dim=0) if use_cfg else new_sel_flat
+
+            new_pos  = gather_pos(new_sel_flat_d, all_pos_instrs)  # [O*B*D, m, dim]
+            new_freq = gather_freq(new_sel_flat_d, all_img_freqs)  # [O*B*D, m, h, w]
+            new_img  = self.tok_embeddings(new_tok_flat)           # [O*B, m, dim]
+            if use_cfg:
+                new_img = torch.cat([new_img, new_img], dim=0)     # [O*B*D, m, dim]
+
+            chunk_ctx   = torch.zeros(O * B * D, 2 * m, self.dim, dtype=committed_ctx.dtype, device=cond.device)
+            chunk_freqs = torch.zeros(O * B * D, 2 * m, freq_h, freq_w, dtype=committed_freqs.dtype, device=cond.device)
+            chunk_ctx[:, ::2]    = new_pos
+            chunk_ctx[:, 1::2]   = new_img
+            chunk_freqs[:, ::2]  = new_freq
+            chunk_freqs[:, 1::2] = new_freq
+            committed_ctx   = torch.cat([committed_ctx,   chunk_ctx],   dim=1)
+            committed_freqs = torch.cat([committed_freqs, chunk_freqs], dim=1)
+
+            # Step 5-4: advance the shared schedule  [SAME AS generate_confidence_first]
+            cur_inference_step += 1
+            num_query_token_next_step = calculate_num_query_tokens_for_parallel_decoding(
+                cur_inference_step, num_inference_steps, self.block_size, k, m)
+            query_token_idx_cur_step = k + m
+            num_query_token_cur_step = num_query_token_next_step
+
+        for l, c in zip(self.layers, saved_caches):
+            l.attention.kv_cache = c
+
+        # Step-6: pick the best-scoring beam per image; result_indices is already in raster order
+        best_beam = torch.argmax(beam_logprob, dim=1)  # [O]
+        result_indices = torch.gather(result_indices, 1,
+                                      best_beam.view(O, 1, 1).expand(-1, 1, self.block_size)).squeeze(1)
+        return result_indices
+
     def generate_with_entropy(
         self,
         cond: torch.Tensor,

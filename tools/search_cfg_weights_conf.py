@@ -86,13 +86,13 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
     torch.manual_seed(seed)
 
     global_batch_size = args.per_proc_batch_size * dist.get_world_size()
-    
+
     cur_iter = 0
     for _ in pbar:
         c_indices = torch.randint(0, args.num_classes, (args.per_proc_batch_size,), device=device)
         cfg_scales = (1.0, cfg_scale)
-    
-        indices = gpt_model.generate(
+
+        indices = gpt_model.generate_confidence_first(
             cond=c_indices,
             token_order=None,
             cfg_scales=cfg_scales,
@@ -103,7 +103,7 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
         )
 
         samples = tokenizer.decode_codes_to_img(indices, args.image_size_eval)
-    
+
         for i, sample in enumerate(samples):
             index = i * dist.get_world_size() + rank + total
             Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
@@ -180,7 +180,7 @@ def main(args):
 
     dist.barrier()
     dist.destroy_process_group()
-    
+
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(args.num_fid_samples_search / global_batch_size) * global_batch_size)
 
@@ -210,13 +210,13 @@ def main(args):
 
         with open(result_file_name, "w") as f:
             json.dump(eval_results, f)
-    
+
     # report the results
     total_samples = int(math.ceil(args.num_fid_samples_report / global_batch_size) * global_batch_size)
     optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
     fid, sfid, IS, precision, recall = sample_and_eval(
         tokenizer, gpt_model, optimal_cfg_scale, args, device, total_samples)
-    
+
     print(f"Optimal CFG scale: {optimal_cfg_scale:.2f}")
     print(f"Eval results for optimal CFG scale: {fid, sfid, IS, precision, recall}")
     eval_results[f"{optimal_cfg_scale:.2f}-report"] = {
