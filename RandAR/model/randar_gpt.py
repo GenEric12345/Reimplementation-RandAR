@@ -107,7 +107,7 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             # [b, n_head, max_seq_len, head_dim]
             keys, values = self.kv_cache.update(input_pos, xk, xv)
-            
+
             # assuming that all the samples in a batch have the same input_pos
             max_pos = torch.max(input_pos) + 1
             keys = keys[:, :, :max_pos]
@@ -374,7 +374,7 @@ class RandARTransformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis_2d(
             grid_size, self.dim // self.n_head, self.rope_base, self.cls_token_num
         )
-    
+
     def remove_caches(self):
         for l in self.layers:
             l.attention.kv_cache = None
@@ -395,7 +395,7 @@ class RandARTransformer(nn.Module):
             return self.forward_train(idx, cond_idx, token_order, input_pos, targets, mask, valid)
         else:
             raise ValueError("idx and cond_idx cannot be both None")
-        
+
     def forward_train(self,
                       idx: torch.Tensor,
                       cond_idx: torch.Tensor,
@@ -428,7 +428,7 @@ class RandARTransformer(nn.Module):
                 token_order = token_order.contiguous()
             else:
                 raise ValueError(f"Invalid position order: {self.position_order}")
-        
+
         # permute the image tokens according to the random order
         idx = torch.gather(idx.unsqueeze(-1), 1, token_order.unsqueeze(-1)).squeeze(-1).contiguous() # [bsz, seq_len]
         targets = torch.gather(targets.unsqueeze(-1), 1, token_order.unsqueeze(-1)).squeeze(-1).contiguous() # [bsz, seq_len]
@@ -447,7 +447,7 @@ class RandARTransformer(nn.Module):
             (cond_embeddings, interleave_tokens(position_instruction_tokens, token_embeddings)),
             dim=1
         )
-        
+
         token_freqs_cis = self.freqs_cis[self.cls_token_num:].clone().to(token_order.device)[token_order]
         freqs_cis = torch.cat(
             (self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1), interleave_tokens(token_freqs_cis, token_freqs_cis)),
@@ -460,7 +460,7 @@ class RandARTransformer(nn.Module):
                 h = checkpoint(layer, h, freqs_cis, input_pos, mask, use_reentrant=False)
             else:
                 h = layer(h, freqs_cis, input_pos, mask)
-        
+
         h = self.norm(h)
         logits = self.output(h).float()
         token_logits = logits[:, self.cls_token_num::2].contiguous()
@@ -477,10 +477,10 @@ class RandARTransformer(nn.Module):
             loss = F.cross_entropy(token_logits.view(-1, token_logits.size(-1)), targets.view(-1))
 
         return token_logits, loss, token_order
-    
-    def forward_inference(self, 
-                          x: torch.Tensor, 
-                          freqs_cis: torch.Tensor, 
+
+    def forward_inference(self,
+                          x: torch.Tensor,
+                          freqs_cis: torch.Tensor,
                           input_pos: torch.Tensor):
         """ Args:
             x: [bs, query_num, dim] Input tokens
@@ -531,7 +531,7 @@ class RandARTransformer(nn.Module):
     def get_position_instruction_tokens(self, token_order):
         position_instruct_tokens = self.pos_instruct_embeddings.view(1, 1, self.n_head, self.dim // self.n_head)
         position_instruct_tokens = position_instruct_tokens.repeat(token_order.shape[0], self.block_size, 1, 1) # [1, block_size, n_head, dim // n_head]
-        
+
         # apply rotary embedding
         position_instruct_freqs_cis = self.freqs_cis[self.cls_token_num:].clone().to(token_order.device)[token_order]
         position_instruct_tokens = batch_apply_rotary_emb(position_instruct_tokens, position_instruct_freqs_cis)
@@ -594,7 +594,7 @@ class RandARTransformer(nn.Module):
             top_p: float Top-p for sampling
         """
         bs = cond.shape[0]
-        
+
         # Step-1: Generate the token orders and result sequences
         if token_order is None:
             token_order = torch.arange(self.block_size, device=cond.device)
@@ -606,9 +606,9 @@ class RandARTransformer(nn.Module):
             token_order = token_order.contiguous()
         else:
             assert token_order.shape == (bs, self.block_size)
-        
+
         result_indices = torch.zeros((bs, self.block_size), dtype=torch.long, device=cond.device)
-        
+
         # Step-2: Prepare the freqs_cis and position_instruction_tokens
         position_instruction_tokens = self.get_position_instruction_tokens(token_order)
         img_token_freq_cis = self.freqs_cis[self.cls_token_num:].clone().to(token_order.device)[token_order]
@@ -623,7 +623,7 @@ class RandARTransformer(nn.Module):
         else:
             cond_combined = cond
         cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
-    
+
         # Step-4: KV Cache setup
         max_seq_len = cond_combined_tokens.shape[1] + self.block_size * 2
         with torch.device(cond.device):
@@ -633,18 +633,18 @@ class RandARTransformer(nn.Module):
         if num_inference_steps == -1:
             # if -1, one token at a time, no parallel decoding
             num_inference_steps = self.block_size
-        
+
         cur_inference_step = 0
         num_query_token_cur_step = 1 # how many tokens to decode at this step
         query_token_idx_cur_step = 0 # the index of the first token to decode at this step
 
         # Step 5-1: Prepare the first step
         # [cls_token, query_token_0, ..., query_token_n]
-        x = torch.cat([cond_combined_tokens, 
-                       position_instruction_tokens[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step]], 
+        x = torch.cat([cond_combined_tokens,
+                       position_instruction_tokens[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step]],
                        dim=1)
-        cur_freqs_cis = torch.cat([self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1), 
-                                   img_token_freq_cis[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step]], 
+        cur_freqs_cis = torch.cat([self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
+                                   img_token_freq_cis[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step]],
                                    dim=1)
         input_pos = torch.arange(0, x.shape[1], device=cond.device)
 
@@ -664,10 +664,10 @@ class RandARTransformer(nn.Module):
             indices = torch.zeros(result_indices.shape[0], num_query_token_cur_step, dtype=torch.long, device=cond.device)
             for i in range(num_query_token_cur_step):
                 indices[:, i : i + 1] = sample(logits[:, i : i + 1], temperature=temperature, top_k=top_k, top_p=top_p)[0]
-            
+
             # save the result tokens
             result_indices[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step] = indices.clone()
-            
+
             img_tokens = self.tok_embeddings(indices)
             if cfg_scales[-1] > 1.0:
                 img_tokens = torch.cat([img_tokens, img_tokens], dim=0)
@@ -675,32 +675,32 @@ class RandARTransformer(nn.Module):
             # Step 5-4: Prepare for the next step
             cur_inference_step += 1
             num_query_token_next_step = calculate_num_query_tokens_for_parallel_decoding(
-                cur_inference_step, num_inference_steps, self.block_size, 
+                cur_inference_step, num_inference_steps, self.block_size,
                 query_token_idx_cur_step, num_query_token_cur_step)
-            
+
             ########## Important: Prepare the tokens ##########
             # [cur_img_0, cur_query_1, ..., cur_query_n, cur_img_n, next_query_0, ..., next_query_m]
             x = torch.zeros(bs, 2 * num_query_token_cur_step - 1 + num_query_token_next_step, self.dim, dtype=x.dtype, device=cond.device)
-            
+
             # cur_img_0
-            x[:, :1] = img_tokens[:, :1] 
-            
+            x[:, :1] = img_tokens[:, :1]
+
             # [cur_query_1, ..., cur_query_n]
             cur_query_position_instruction_tokens = position_instruction_tokens[:, query_token_idx_cur_step + 1 : query_token_idx_cur_step + num_query_token_cur_step]
             x[:, 1 : 2 * num_query_token_cur_step - 1][:, ::2] = cur_query_position_instruction_tokens
-            
+
             # [cur_img_1, ..., cur_img_n]
             x[:, 1 : 2 * num_query_token_cur_step - 1][:, 1::2] = img_tokens[:, 1 : num_query_token_cur_step]
-            
+
             # [next_query_0, ..., next_query_m]
             query_token_idx_next_step = query_token_idx_cur_step + num_query_token_cur_step
             next_position_instruction_tokens = position_instruction_tokens[:, query_token_idx_next_step : query_token_idx_next_step + num_query_token_next_step]
             x[:, 2 * num_query_token_cur_step - 1 :] = next_position_instruction_tokens
 
             ########## Important: Prepare the freqs_cis ##########
-            cur_freqs_cis = torch.zeros((bs, 2 * num_query_token_cur_step - 1 + num_query_token_next_step, *self.freqs_cis.shape[-2:]), 
+            cur_freqs_cis = torch.zeros((bs, 2 * num_query_token_cur_step - 1 + num_query_token_next_step, *self.freqs_cis.shape[-2:]),
                                          dtype=cur_freqs_cis.dtype, device=cond.device)
-            
+
             # cur_img_0
             cur_freqs_cis[:, :1] = img_token_freq_cis[:, query_token_idx_cur_step : query_token_idx_cur_step + 1]
 
@@ -719,11 +719,11 @@ class RandARTransformer(nn.Module):
             query_token_idx_cur_step = query_token_idx_next_step
             if query_token_idx_cur_step > self.block_size:
                 break
-            
+
             last_input_pos = input_pos[input_pos.shape[0] - num_query_token_cur_step] # position of cur_query_0
             input_pos = torch.arange(2 * num_query_token_cur_step - 1 + num_query_token_next_step, device=cond.device, dtype=torch.long) + last_input_pos + 1
             num_query_token_cur_step = num_query_token_next_step
-        
+
         # Step 6: Return to raster order for tokenizer decoding
         reverse_permutation = torch.argsort(token_order, dim=-1).long().unsqueeze(-1).expand(-1, -1, 1)
         result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
@@ -752,6 +752,21 @@ class RandARTransformer(nn.Module):
         Returns:
             result_indices: [bsz, block_size] sampled tokens in raster order.
         """
+        bs = cond.shape[0]
+        ###Creating token order just as a test:
+        # Step-1: Generate the token orders and result sequences
+        if token_order is None:
+            token_order = torch.arange(self.block_size, device=cond.device)
+            token_order = token_order.unsqueeze(0).repeat(bs, 1)
+            token_order = token_order.contiguous()
+            if self.position_order == "random":
+                for i in range(bs):
+                    token_order[i] = token_order[i][torch.randperm(self.block_size)]
+            token_order = token_order.contiguous()
+        else:
+            assert token_order.shape == (bs, self.block_size)
+
+
         bs = cond.shape[0]
         original_bs = bs  # [CHANGE] keep original bs before CFG doubling
 
@@ -882,7 +897,9 @@ class RandARTransformer(nn.Module):
         # [CHANGE] Step 5-1: per-image probe to select the first position.   #
         # generate() uses position_instruction_tokens[:, 0] for every image. #
         # ------------------------------------------------------------------ #
-        cur_sel = probe_and_select(num_query_token_cur_step, query_token_idx_cur_step)
+        ###Switch to token order to isolate fid problem
+        #cur_sel = probe_and_select(num_query_token_cur_step, query_token_idx_cur_step)
+        cur_sel = token_order[:, query_token_idx_cur_step: query_token_idx_cur_step + num_query_token_cur_step]
         # cur_sel: [original_bs, 1]
         filled_mask.scatter_(1, cur_sel, True)
 
@@ -949,7 +966,9 @@ class RandARTransformer(nn.Module):
 
             # [CHANGE] per-image probe to select the next batch of positions
             if query_token_idx_next_step < self.block_size and num_query_token_next_step > 0:
-                next_sel = probe_and_select(num_query_token_next_step, query_token_idx_next_step)
+                #To isolate the issue CHANGE BACK LATER
+                #next_sel = probe_and_select(num_query_token_next_step, query_token_idx_next_step)
+                next_sel = token_order[:, query_token_idx_next_step: query_token_idx_next_step + num_query_token_next_step]
                 # next_sel: [original_bs, m_next]
                 filled_mask.scatter_(1, next_sel, True)
             else:
