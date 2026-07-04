@@ -857,8 +857,23 @@ class RandARTransformer(nn.Module):
         # returned a single shared 1-D selection for all images.              #
         # ------------------------------------------------------------------ #
         def probe_and_select(num_to_select: int, step_progress: int) -> torch.Tensor:
-            probe_x     = torch.cat([committed_ctx,   all_pos_instrs], dim=1)  # [bs, ctx+block_size, dim]
-            probe_freqs = torch.cat([committed_freqs, all_img_freqs],  dim=1)
+            # unfilled positions per image: [original_bs, num_unfilled]
+            unfilled = (~filled_mask).nonzero(as_tuple=False)  # [N, 2]
+
+            # This only works cleanly if every image has same num_unfilled
+            num_unfilled = (~filled_mask).sum(dim=1)[0].item()
+            assert torch.all((~filled_mask).sum(dim=1) == num_unfilled)
+
+            unfilled_sel = unfilled[:, 1].view(original_bs, num_unfilled)  # raster indices
+
+            # duplicate for CFG if needed: [bs, num_unfilled]
+            unfilled_sel_bs = to_bs(unfilled_sel)
+
+            probe_pos   = gather_pos(unfilled_sel_bs)
+            probe_freqs_only = gather_freq(unfilled_sel_bs)
+
+            probe_x = torch.cat([committed_ctx, probe_pos], dim=1)
+            probe_freqs = torch.cat([committed_freqs, probe_freqs_only], dim=1)
 
             saved = [l.attention.kv_cache for l in self.layers]
             for l in self.layers:
@@ -868,29 +883,30 @@ class RandARTransformer(nn.Module):
             for layer in self.layers:
                 h = layer(h, probe_freqs, start_pos=None, mask=None)
             h = self.norm(h)
-            probe_logits = self.output(h).float()[:, -self.block_size:]  # [bs, block_size, vocab]
+
+            # only logits for unfilled probes
+            probe_logits = self.output(h).float()[:, -num_unfilled:]  # [bs, num_unfilled, vocab]
 
             for l, c in zip(self.layers, saved):
                 l.attention.kv_cache = c
 
             if use_cfg:
-                cur_cfg = (cfg_scales[0]
-                           + (cfg_scales[-1] - cfg_scales[0]) * step_progress / self.block_size)
+                cur_cfg = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * step_progress / self.block_size
                 cond_log, uncond_log = torch.chunk(probe_logits, 2, dim=0)
-                ent_logits = uncond_log + cur_cfg * (cond_log - uncond_log)  # [original_bs, block_size, vocab]
+                ent_logits = uncond_log + cur_cfg * (cond_log - uncond_log)
             else:
-                ent_logits = probe_logits  # [original_bs, block_size, vocab]
+                ent_logits = probe_logits
 
-            probs   = torch.softmax(ent_logits, dim=-1)
-            entropy = -(probs * torch.log(probs.clamp(min=1e-10))).sum(dim=-1)  # [original_bs, block_size]
+            probs = torch.softmax(ent_logits, dim=-1)
+            entropy = -(probs * torch.log(probs.clamp(min=1e-10))).sum(dim=-1)
+            # entropy: [original_bs, num_unfilled]
 
-            # per-image: mask already-filled positions so they cannot be re-selected
-            entropy = entropy.masked_fill(filled_mask, float('inf'))
+            _, local_topk = torch.topk(entropy, num_to_select, dim=1, largest=False)
+            topk_H = torch.gather(entropy, 1, local_topk)
+            local_sel = torch.gather(local_topk, 1, torch.argsort(topk_H, dim=1))
 
-            # per-image: top num_to_select lowest-entropy positions, sorted lowest-first
-            _, topk  = torch.topk(entropy, num_to_select, dim=1, largest=False)  # [original_bs, num_to_select]
-            topk_H   = torch.gather(entropy, 1, topk)
-            sel      = torch.gather(topk, 1, torch.argsort(topk_H, dim=1))       # [original_bs, num_to_select]
+            # map local unfilled indices back to raster positions
+            sel = torch.gather(unfilled_sel, 1, local_sel)  # [original_bs, num_to_select]
             return sel
 
         # ------------------------------------------------------------------ #
@@ -898,13 +914,15 @@ class RandARTransformer(nn.Module):
         # generate() uses position_instruction_tokens[:, 0] for every image. #
         # ------------------------------------------------------------------ #
         ###Switch to token order to isolate fid problem
-        #cur_sel = probe_and_select(num_query_token_cur_step, query_token_idx_cur_step)
-        cur_sel = token_order[:, query_token_idx_cur_step: query_token_idx_cur_step + num_query_token_cur_step]
+        cur_sel = probe_and_select(num_query_token_cur_step, query_token_idx_cur_step)
+        #cur_sel = token_order[:, query_token_idx_cur_step: query_token_idx_cur_step + num_query_token_cur_step]
         # cur_sel: [original_bs, 1]
         filled_mask.scatter_(1, cur_sel, True)
 
         sel_bs = to_bs(cur_sel)  # [bs, 1]
         x = torch.cat([cond_combined_tokens, gather_pos(sel_bs)], dim=1)
+        ###The :self.cls_token_num is the same since its irrespective of token order
+        ###The gather_freq(sel_bs) gets the img_freq for the next token order selection.
         cur_freqs_cis = torch.cat([
             self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
             gather_freq(sel_bs)
@@ -967,8 +985,8 @@ class RandARTransformer(nn.Module):
             # [CHANGE] per-image probe to select the next batch of positions
             if query_token_idx_next_step < self.block_size and num_query_token_next_step > 0:
                 #To isolate the issue CHANGE BACK LATER
-                #next_sel = probe_and_select(num_query_token_next_step, query_token_idx_next_step)
-                next_sel = token_order[:, query_token_idx_next_step: query_token_idx_next_step + num_query_token_next_step]
+                next_sel = probe_and_select(num_query_token_next_step, query_token_idx_next_step)
+                #next_sel = token_order[:, query_token_idx_next_step: query_token_idx_next_step + num_query_token_next_step]
                 # next_sel: [original_bs, m_next]
                 filled_mask.scatter_(1, next_sel, True)
             else:
