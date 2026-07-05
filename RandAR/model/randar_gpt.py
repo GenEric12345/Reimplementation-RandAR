@@ -80,6 +80,8 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor = None,
         input_pos: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        cache_read_only: bool = False,
+        prefix_len: Optional[int] = None
     ):
         """
         during inference:
@@ -102,18 +104,32 @@ class Attention(nn.Module):
         xk = batch_apply_rotary_emb(xk, freqs_cis)
 
         xq, xk, xv = map(lambda x: x.transpose(1, 2), (xq, xk, xv))
+        is_causal = True if mask is None else False
+
+
 
         # this part is modified from LLaMAGen
         if self.kv_cache is not None:
-            # [b, n_head, max_seq_len, head_dim]
-            keys, values = self.kv_cache.update(input_pos, xk, xv)
+            ###Do not update KV Cache for probing
+            if cache_read_only:
+                assert prefix_len is not None
+                cached_k = self.kv_cache.k_cache[:bsz, :, :prefix_len]
+                cached_v = self.kv_cache.v_cache[:bsz, :, :prefix_len]
 
-            # assuming that all the samples in a batch have the same input_pos
-            max_pos = torch.max(input_pos) + 1
-            keys = keys[:, :, :max_pos]
-            values = values[:, :, :max_pos]
-            if mask is not None:
-                mask = mask[:, :, :, :max_pos]
+                keys = torch.cat([cached_k, xk], dim=2)
+                values = torch.cat([cached_v, xv], dim=2)
+                mask = None
+                is_causal = False
+            else:
+                # [b, n_head, max_seq_len, head_dim]
+                keys, values = self.kv_cache.update(input_pos, xk, xv)
+
+                # assuming that all the samples in a batch have the same input_pos
+                max_pos = torch.max(input_pos) + 1
+                keys = keys[:, :, :max_pos]
+                values = values[:, :, :max_pos]
+                if mask is not None:
+                    mask = mask[:, :, :, :max_pos]
         else:
             keys, values = xk, xv
 
@@ -125,9 +141,7 @@ class Attention(nn.Module):
             keys,
             values,
             attn_mask=mask,
-            is_causal=(
-                True if mask is None else False
-            ),  # is_causal=False is for KV cache
+            is_causal = is_causal
             dropout_p=self.attn_dropout_p if self.training else 0,
         )
 
@@ -222,9 +236,11 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         start_pos: int,
         mask: Optional[torch.Tensor] = None,
+        cache_read_only: bool = False,
+        prefix_len: Optional[int] = None,
     ):
         h = x + self.drop_path(
-            self.attention(self.attention_norm(x), freqs_cis, start_pos, mask)
+            self.attention(self.attention_norm(x), freqs_cis, start_pos, mask, cache_read_only=cache_read_only, prefix_len=prefix_len)
         )
         out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
         return out
@@ -381,6 +397,9 @@ class RandARTransformer(nn.Module):
         self.max_batch_size = -1
         self.max_seq_length = -1
 
+
+
+
     def forward(
         self,
         idx: torch.Tensor,
@@ -496,6 +515,19 @@ class RandARTransformer(nn.Module):
         logits = self.output(h).float()
         return logits
 
+    def forward_probe_from_cache(self, x, freqs_cis, prefix_len):
+        h = x
+        for layer in self.layers:
+            h = layer(
+                h,
+                freqs_cis,
+                start_pos=None,
+                mask=None,
+                cache_read_only=True,
+                prefix_len=prefix_len,
+            )
+        h = self.norm(h)
+        return self.output(h).float()
     def forward_inference_with_attn(
         self,
         x: torch.Tensor,
@@ -871,24 +903,9 @@ class RandARTransformer(nn.Module):
 
             probe_pos   = gather_pos(unfilled_sel_bs)
             probe_freqs_only = gather_freq(unfilled_sel_bs)
+            prefix_len = committed_ctx.shape[1]
 
-            probe_x = torch.cat([committed_ctx, probe_pos], dim=1)
-            probe_freqs = torch.cat([committed_freqs, probe_freqs_only], dim=1)
-
-            saved = [l.attention.kv_cache for l in self.layers]
-            for l in self.layers:
-                l.attention.kv_cache = None
-
-            h = probe_x
-            for layer in self.layers:
-                h = layer(h, probe_freqs, start_pos=None, mask=None)
-            h = self.norm(h)
-
-            # only logits for unfilled probes
-            probe_logits = self.output(h).float()[:, -num_unfilled:]  # [bs, num_unfilled, vocab]
-
-            for l, c in zip(self.layers, saved):
-                l.attention.kv_cache = c
+            probe_logits = self.forward_probe_from_cache(probe_pos, probe_freqs_only, prefix_len=prefix_len)
 
             if use_cfg:
                 cur_cfg = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * step_progress / self.block_size
@@ -928,6 +945,13 @@ class RandARTransformer(nn.Module):
             gather_freq(sel_bs)
         ], dim=1)
         input_pos = torch.arange(0, x.shape[1], device=cond.device)
+
+        ### To prime the cache with conditional tokens
+        cond_freqs = self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1)
+        cond_pos = torch.arange(self.cls_token_num, device=cond.device)
+
+        _ = self.forward_inference(cond_combined_tokens, cond_freqs, cond_pos)
+
 
         # Step 5-2: Start the loop  [SAME loop condition as generate]
         while (query_token_idx_cur_step <= self.block_size - num_query_token_cur_step
