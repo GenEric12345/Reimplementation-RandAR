@@ -141,7 +141,7 @@ class Attention(nn.Module):
             keys,
             values,
             attn_mask=mask,
-            is_causal = is_causal
+            is_causal=is_causal,
             dropout_p=self.attn_dropout_p if self.training else 0,
         )
 
@@ -853,6 +853,21 @@ class RandARTransformer(nn.Module):
         committed_ctx   = cond_combined_tokens                                             # [bs, cls_token_num, dim]
         committed_freqs = self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1)
 
+        ### Prime the cache with conditional tokens BEFORE the first probe pass,
+        ### so probe_and_select never reads uninitialized cache slots.
+        cond_freqs = self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1)
+        cond_pos = torch.arange(self.cls_token_num, device=cond.device)
+        _ = self.forward_inference(cond_combined_tokens, cond_freqs, cond_pos)
+
+        # [CHANGE] cache_len tracks how many entries are actually physically
+        # written into the real KV cache (as opposed to committed_ctx.shape[1],
+        # which includes the current step's img-token half before it's been
+        # committed via a real forward_inference call). BUG FIX: probe_and_select
+        # used to read committed_ctx.shape[1] as prefix_len, which is ahead of
+        # the real cache by the previous step's chunk size, so probes attended
+        # to uninitialized (zero) cache slots for the tail of the context.
+        cache_len = self.cls_token_num
+
         # ------------------------------------------------------------------ #
         # [CHANGE] Per-image gather helpers.                                  #
         # sel_bs has shape [bs, m] (per-image raster indices, CFG-doubled).  #
@@ -903,7 +918,7 @@ class RandARTransformer(nn.Module):
 
             probe_pos   = gather_pos(unfilled_sel_bs)
             probe_freqs_only = gather_freq(unfilled_sel_bs)
-            prefix_len = committed_ctx.shape[1]
+            prefix_len = cache_len
 
             probe_logits = self.forward_probe_from_cache(probe_pos, probe_freqs_only, prefix_len=prefix_len)
 
@@ -946,13 +961,6 @@ class RandARTransformer(nn.Module):
         ], dim=1)
         input_pos = torch.arange(0, x.shape[1], device=cond.device)
 
-        ### To prime the cache with conditional tokens
-        cond_freqs = self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1)
-        cond_pos = torch.arange(self.cls_token_num, device=cond.device)
-
-        _ = self.forward_inference(cond_combined_tokens, cond_freqs, cond_pos)
-
-
         # Step 5-2: Start the loop  [SAME loop condition as generate]
         while (query_token_idx_cur_step <= self.block_size - num_query_token_cur_step
                and query_token_idx_cur_step <= self.block_size - 1):
@@ -962,6 +970,9 @@ class RandARTransformer(nn.Module):
 
             # Step 5-3: commit forward pass  [SAME AS generate]
             logits = self.forward_inference(x, cur_freqs_cis, input_pos)
+            # [CHANGE] keep cache_len in sync with what's actually been written
+            # into the real KV cache by this real (non-probe) forward pass.
+            cache_len = int(input_pos[-1].item()) + 1
 
             # apply CFG  [SAME AS generate]
             if use_cfg:
