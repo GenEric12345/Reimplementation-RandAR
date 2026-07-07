@@ -770,15 +770,22 @@ class RandARTransformer(nn.Module):
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        probe_candidate_multiplier: int = 4,
+        probe_min_candidates: int = 32,
     ):
         """Like generate(), but at each parallel-decoding step each image
         independently selects its num_query_token_cur_step unfilled positions
         with lowest predictive entropy (highest confidence).
 
         At each step a single parallel forward pass (no KV cache) is run over
-        [committed_context, all_pos_instrs] to obtain per-image entropy for
-        every raster position; each image then picks its own top-K lowest-
-        entropy unfilled slots.  The commit forward pass mirrors generate()
+        [committed_context, probed_candidates] to obtain per-image entropy for
+        a random subset of the still-unfilled raster positions; each image
+        then picks its own top-K lowest-entropy slots from that subset. The
+        candidate subset has size min(num_unfilled, max(num_to_select *
+        probe_candidate_multiplier, probe_min_candidates)), so early steps
+        (where num_unfilled is close to block_size but only a handful of
+        tokens are being committed) probe a small sample instead of every
+        remaining position. The commit forward pass mirrors generate()
         exactly.  token_order is ignored.
 
         Returns:
@@ -913,11 +920,29 @@ class RandARTransformer(nn.Module):
 
             unfilled_sel = unfilled[:, 1].view(original_bs, num_unfilled)  # raster indices
 
-            # duplicate for CFG if needed: [bs, num_unfilled]
-            unfilled_sel_bs = to_bs(unfilled_sel)
+            # [CHANGE] Probe a random subset of the unfilled positions instead
+            # of all of them. Entropy-ranking only needs to beat num_to_select
+            # winners, so scoring every remaining position is wasted work,
+            # especially early in the cosine decode schedule where
+            # num_unfilled stays close to block_size for many steps while
+            # num_to_select is still small. Falls back to the full unfilled
+            # set once it's already <= the candidate budget (e.g. late steps).
+            num_candidates = min(
+                num_unfilled,
+                max(num_to_select * probe_candidate_multiplier, probe_min_candidates),
+            )
+            if num_candidates < num_unfilled:
+                rand_scores = torch.rand(original_bs, num_unfilled, device=cond.device)
+                cand_local = torch.topk(rand_scores, num_candidates, dim=1, largest=False).indices
+                candidate_sel = torch.gather(unfilled_sel, 1, cand_local)  # [original_bs, num_candidates]
+            else:
+                candidate_sel = unfilled_sel
 
-            probe_pos   = gather_pos(unfilled_sel_bs)
-            probe_freqs_only = gather_freq(unfilled_sel_bs)
+            # duplicate for CFG if needed: [bs, num_candidates]
+            candidate_sel_bs = to_bs(candidate_sel)
+
+            probe_pos   = gather_pos(candidate_sel_bs)
+            probe_freqs_only = gather_freq(candidate_sel_bs)
             prefix_len = cache_len
 
             probe_logits = self.forward_probe_from_cache(probe_pos, probe_freqs_only, prefix_len=prefix_len)
@@ -931,14 +956,14 @@ class RandARTransformer(nn.Module):
 
             probs = torch.softmax(ent_logits, dim=-1)
             entropy = -(probs * torch.log(probs.clamp(min=1e-10))).sum(dim=-1)
-            # entropy: [original_bs, num_unfilled]
+            # entropy: [original_bs, num_candidates]
 
             _, local_topk = torch.topk(entropy, num_to_select, dim=1, largest=False)
             topk_H = torch.gather(entropy, 1, local_topk)
             local_sel = torch.gather(local_topk, 1, torch.argsort(topk_H, dim=1))
 
-            # map local unfilled indices back to raster positions
-            sel = torch.gather(unfilled_sel, 1, local_sel)  # [original_bs, num_to_select]
+            # map local candidate indices back to raster positions
+            sel = torch.gather(candidate_sel, 1, local_sel)  # [original_bs, num_to_select]
             return sel
 
         # ------------------------------------------------------------------ #
