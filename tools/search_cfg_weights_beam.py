@@ -91,10 +91,13 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
     for _ in pbar:
         c_indices = torch.randint(0, args.num_classes, (args.per_proc_batch_size,), device=device)
         cfg_scales = (1.0, cfg_scale)
-
-        indices = gpt_model.generate_beam(
+        token_order = torch.arange(256, device=c_indices.device)
+        bs = c_indices.shape[0]
+        token_order = token_order.unsqueeze(0).repeat(bs, 1)
+        token_order = token_order.contiguous() 
+        indices = gpt_model.generate(
             cond=c_indices,
-            token_order=None,
+            token_order=token_order,
             cfg_scales=cfg_scales,
             num_inference_steps=args.num_inference_steps,
             temperature=args.temperature,
