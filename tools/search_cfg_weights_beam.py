@@ -27,6 +27,44 @@ from RandAR.util import instantiate_from_config, load_safetensors
 from RandAR.eval.fid import compute_fid
 
 
+def generate_patch_token_order(bs, device, grid_size, patch_size=2):
+    """ Builds a random token order where tokens are decoded in contiguous
+    groups of `patch_size**2`, each group being the cells of one spatial
+    `patch_size x patch_size` patch of the `grid_size x grid_size` token grid.
+    Both the order of patches and the order of cells within each patch are
+    randomized independently per sample.
+    """
+    assert grid_size % patch_size == 0
+    patches_per_side = grid_size // patch_size
+    num_patches = patches_per_side * patches_per_side
+    cells_per_patch = patch_size * patch_size
+
+    patch_row, patch_col = torch.meshgrid(
+        torch.arange(patches_per_side), torch.arange(patches_per_side), indexing="ij"
+    )
+    patch_row = patch_row.reshape(-1)  # [num_patches]
+    patch_col = patch_col.reshape(-1)  # [num_patches]
+
+    cell_row, cell_col = torch.meshgrid(
+        torch.arange(patch_size), torch.arange(patch_size), indexing="ij"
+    )
+    cell_row = cell_row.reshape(-1)  # [cells_per_patch]
+    cell_col = cell_col.reshape(-1)  # [cells_per_patch]
+
+    row = patch_row[:, None] * patch_size + cell_row[None, :]  # [num_patches, cells_per_patch]
+    col = patch_col[:, None] * patch_size + cell_col[None, :]  # [num_patches, cells_per_patch]
+    patch_cells = (row * grid_size + col).to(device)  # [num_patches, cells_per_patch], raster indices
+
+    token_order = torch.zeros((bs, num_patches * cells_per_patch), dtype=torch.long, device=device)
+    for i in range(bs):
+        patch_perm = torch.randperm(num_patches, device=device)
+        ordered_patches = patch_cells[patch_perm]  # [num_patches, cells_per_patch]
+        cell_perm = torch.stack([torch.randperm(cells_per_patch, device=device) for _ in range(num_patches)])
+        ordered_patches = torch.gather(ordered_patches, 1, cell_perm)
+        token_order[i] = ordered_patches.reshape(-1)
+    return token_order
+
+
 def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
     Builds a single .npz file from a folder of .png samples.
@@ -91,11 +129,10 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
     for _ in pbar:
         c_indices = torch.randint(0, args.num_classes, (args.per_proc_batch_size,), device=device)
         cfg_scales = (1.0, cfg_scale)
-        token_order = torch.arange(256, device=c_indices.device)
         bs = c_indices.shape[0]
-        token_order = token_order.unsqueeze(0).repeat(bs, 1)
-        token_order = token_order.contiguous() 
-        indices = gpt_model.generate(
+        grid_size = args.image_size // args.downsample_size
+        token_order = generate_patch_token_order(bs, device=c_indices.device, grid_size=grid_size, patch_size=2)
+        indices = gpt_model.variable_schedule_generate(
             cond=c_indices,
             token_order=token_order,
             cfg_scales=cfg_scales,

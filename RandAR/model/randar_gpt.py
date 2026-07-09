@@ -604,6 +604,159 @@ class RandARTransformer(nn.Module):
             **extra_args
         )
         return optimizer
+    def variable_schedule_generate(
+        self,
+        cond: torch.Tensor,
+        token_order: torch.Tensor,
+        cfg_scales: Tuple[float, float] = (1.0, 1.0),
+        num_inference_steps: int = 88,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ):
+        """ Args:
+            cond: [bsz, seq_len] Conditional tokens
+            token_order: [bsz, seq_len] Position order for each token
+            cfg_scales: Tuple (cfg_scale_start, cfg_scale_end) linear cfg scales, set start=end for constant cfg_scale
+            num_inference_steps: int Number of inference steps, set to -1 or the number of image tokens to disable parallel decoding
+            temperature: float Temperature for sampling
+            top_k: int Top-k for sampling
+            top_p: float Top-p for sampling
+        """
+        bs = cond.shape[0]
+
+        # Step-1: Generate the token orders and result sequences
+        if token_order is None:
+            token_order = torch.arange(self.block_size, device=cond.device)
+            token_order = token_order.unsqueeze(0).repeat(bs, 1)
+            token_order = token_order.contiguous()
+            if self.position_order == "random":
+                for i in range(bs):
+                    token_order[i] = token_order[i][torch.randperm(self.block_size)]
+            token_order = token_order.contiguous()
+        else:
+            assert token_order.shape == (bs, self.block_size)
+
+        result_indices = torch.zeros((bs, self.block_size), dtype=torch.long, device=cond.device)
+
+        # Step-2: Prepare the freqs_cis and position_instruction_tokens
+        position_instruction_tokens = self.get_position_instruction_tokens(token_order)
+        img_token_freq_cis = self.freqs_cis[self.cls_token_num:].clone().to(token_order.device)[token_order]
+
+        # Step-3: Prepare CFG
+        if cfg_scales[-1] > 1.0:
+            cond_null = torch.ones_like(cond) * self.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+            img_token_freq_cis = torch.cat([img_token_freq_cis, img_token_freq_cis])
+            position_instruction_tokens = torch.cat([position_instruction_tokens, position_instruction_tokens])
+            bs *= 2
+        else:
+            cond_combined = cond
+        cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
+
+        # Step-4: KV Cache setup
+        max_seq_len = cond_combined_tokens.shape[1] + self.block_size * 2
+        with torch.device(cond.device):
+            self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len, dtype=self.tok_embeddings.weight.dtype)
+
+        # Step-5: Autoregressive generation with parallel decoding
+        if num_inference_steps == -1:
+            # if -1, one token at a time, no parallel decoding
+            num_inference_steps = self.block_size
+
+        cur_inference_step = 0
+        num_query_token_cur_step = 1 # how many tokens to decode at this step
+        query_token_idx_cur_step = 0 # the index of the first token to decode at this step
+
+        # Step 5-1: Prepare the first step
+        # [cls_token, query_token_0, ..., query_token_n]
+        x = torch.cat([cond_combined_tokens,
+                       position_instruction_tokens[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step]],
+                       dim=1)
+        cur_freqs_cis = torch.cat([self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
+                                   img_token_freq_cis[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step]],
+                                   dim=1)
+        input_pos = torch.arange(0, x.shape[1], device=cond.device)
+
+        # Step 5-2: Start the loop
+        while query_token_idx_cur_step <= self.block_size - num_query_token_cur_step and query_token_idx_cur_step <= self.block_size - 1:
+            # Step 5-3: Decode the current step tokens
+            logits = self.forward_inference(x, cur_freqs_cis, input_pos)
+
+            # apply CFG
+            if cfg_scales[-1] > 1.0:
+                cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
+                cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
+                logits = uncond_logits + cur_cfg_scale * (cond_logits - uncond_logits)
+
+            # query tokens' logits and indices
+            logits = logits[:, -num_query_token_cur_step:] # [bs, query_num, vocab_size]
+            indices = torch.zeros(result_indices.shape[0], num_query_token_cur_step, dtype=torch.long, device=cond.device)
+            for i in range(num_query_token_cur_step):
+                indices[:, i : i + 1] = sample(logits[:, i : i + 1], temperature=temperature, top_k=top_k, top_p=top_p)[0]
+
+            # save the result tokens
+            result_indices[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step] = indices.clone()
+
+            img_tokens = self.tok_embeddings(indices)
+            if cfg_scales[-1] > 1.0:
+                img_tokens = torch.cat([img_tokens, img_tokens], dim=0)
+
+            # Step 5-4: Prepare for the next step
+            cur_inference_step += 1
+            num_query_token_next_step = 4
+
+            ########## Important: Prepare the tokens ##########
+            # [cur_img_0, cur_query_1, ..., cur_query_n, cur_img_n, next_query_0, ..., next_query_m]
+            x = torch.zeros(bs, 2 * num_query_token_cur_step - 1 + num_query_token_next_step, self.dim, dtype=x.dtype, device=cond.device)
+
+            # cur_img_0
+            x[:, :1] = img_tokens[:, :1]
+
+            # [cur_query_1, ..., cur_query_n]
+            cur_query_position_instruction_tokens = position_instruction_tokens[:, query_token_idx_cur_step + 1 : query_token_idx_cur_step + num_query_token_cur_step]
+            x[:, 1 : 2 * num_query_token_cur_step - 1][:, ::2] = cur_query_position_instruction_tokens
+
+            # [cur_img_1, ..., cur_img_n]
+            x[:, 1 : 2 * num_query_token_cur_step - 1][:, 1::2] = img_tokens[:, 1 : num_query_token_cur_step]
+
+            # [next_query_0, ..., next_query_m]
+            query_token_idx_next_step = query_token_idx_cur_step + num_query_token_cur_step
+            next_position_instruction_tokens = position_instruction_tokens[:, query_token_idx_next_step : query_token_idx_next_step + num_query_token_next_step]
+            x[:, 2 * num_query_token_cur_step - 1 :] = next_position_instruction_tokens
+
+            ########## Important: Prepare the freqs_cis ##########
+            cur_freqs_cis = torch.zeros((bs, 2 * num_query_token_cur_step - 1 + num_query_token_next_step, *self.freqs_cis.shape[-2:]),
+                                         dtype=cur_freqs_cis.dtype, device=cond.device)
+
+            # cur_img_0
+            cur_freqs_cis[:, :1] = img_token_freq_cis[:, query_token_idx_cur_step : query_token_idx_cur_step + 1]
+
+            # [cur_query_1, ..., cur_query_n]
+            cur_query_freq_cis = img_token_freq_cis[:, query_token_idx_cur_step + 1 : query_token_idx_cur_step + num_query_token_cur_step]
+            cur_freqs_cis[:, 1 : 2 * num_query_token_cur_step - 1][:, ::2] = cur_query_freq_cis
+
+            # [cur_img_1, ..., cur_img_n]
+            cur_freqs_cis[:, 1 : 2 * num_query_token_cur_step - 1][:, 1::2] = cur_query_freq_cis
+
+            # [next_query_0, ..., next_query_m]
+            next_freq_cis = img_token_freq_cis[:, query_token_idx_next_step : query_token_idx_next_step + num_query_token_next_step]
+            cur_freqs_cis[:, 2 * num_query_token_cur_step - 1 :] = next_freq_cis
+
+            # Step 5-5: Move the query pointer idx
+            query_token_idx_cur_step = query_token_idx_next_step
+            if query_token_idx_cur_step > self.block_size:
+                break
+
+            last_input_pos = input_pos[input_pos.shape[0] - num_query_token_cur_step] # position of cur_query_0
+            input_pos = torch.arange(2 * num_query_token_cur_step - 1 + num_query_token_next_step, device=cond.device, dtype=torch.long) + last_input_pos + 1
+            num_query_token_cur_step = num_query_token_next_step
+
+        # Step 6: Return to raster order for tokenizer decoding
+        reverse_permutation = torch.argsort(token_order, dim=-1).long().unsqueeze(-1).expand(-1, -1, 1)
+        result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
+        return result_indices
+
 
     # large changes to LLaMAGen, directly supporting parallel decoding controlled by num_inference_steps
     def generate(
