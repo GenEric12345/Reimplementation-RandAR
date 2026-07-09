@@ -82,7 +82,7 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     return npz_path
 
 
-def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples, patch_size):
+def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples):
     # Setup DDP:
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -131,7 +131,7 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
         cfg_scales = (1.0, cfg_scale)
         bs = c_indices.shape[0]
         grid_size = args.image_size // args.downsample_size
-        token_order = generate_patch_token_order(bs, device=c_indices.device, grid_size=grid_size, patch_size=patch_size)
+        token_order = generate_patch_token_order(bs, device=c_indices.device, grid_size=grid_size, patch_size=args.patch_size)
         indices = gpt_model.variable_schedule_generate(
             cond=c_indices,
             token_order=token_order,
@@ -299,6 +299,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--ref-path", type=str, default="/tmp/VIRTUAL_imagenet256_labeled.npz")
+    parser.add_argument("--patch_size", type=int, default=2)
     # output results
     parser.add_argument("--results-path", type=str, default="./results")
     args = parser.parse_args()
