@@ -82,7 +82,7 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     return npz_path
 
 
-def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples):
+def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples, patch_size):
     # Setup DDP:
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -131,7 +131,7 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
         cfg_scales = (1.0, cfg_scale)
         bs = c_indices.shape[0]
         grid_size = args.image_size // args.downsample_size
-        token_order = generate_patch_token_order(bs, device=c_indices.device, grid_size=grid_size, patch_size=2)
+        token_order = generate_patch_token_order(bs, device=c_indices.device, grid_size=grid_size, patch_size=patch_size)
         indices = gpt_model.variable_schedule_generate(
             cond=c_indices,
             token_order=token_order,
