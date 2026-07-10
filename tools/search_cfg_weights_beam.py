@@ -140,6 +140,7 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
+            patch_size = args.patch_size ** 2
         )
 
         samples = tokenizer.decode_codes_to_img(indices, args.image_size_eval)

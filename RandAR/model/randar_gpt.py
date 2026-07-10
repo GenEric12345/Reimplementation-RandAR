@@ -613,6 +613,7 @@ class RandARTransformer(nn.Module):
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        patch_size: int = 4,
     ):
         """ Args:
             cond: [bsz, seq_len] Conditional tokens
@@ -665,7 +666,7 @@ class RandARTransformer(nn.Module):
             num_inference_steps = self.block_size
 
         cur_inference_step = 0
-        num_query_token_cur_step = 4 # how many tokens to decode at this step
+        num_query_token_cur_step = patch_size # how many tokens to decode at this step
         query_token_idx_cur_step = 0 # the index of the first token to decode at this step
 
         # Step 5-1: Prepare the first step
@@ -704,7 +705,7 @@ class RandARTransformer(nn.Module):
 
             # Step 5-4: Prepare for the next step
             cur_inference_step += 1
-            num_query_token_next_step = 4
+            num_query_token_next_step = patch_size
 
             ########## Important: Prepare the tokens ##########
             # [cur_img_0, cur_query_1, ..., cur_query_n, cur_img_n, next_query_0, ..., next_query_m]
