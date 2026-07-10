@@ -705,7 +705,8 @@ class RandARTransformer(nn.Module):
 
             # Step 5-4: Prepare for the next step
             cur_inference_step += 1
-            num_query_token_next_step = patch_size
+            query_token_idx_next_step = query_token_idx_cur_step + num_query_token_cur_step
+            num_query_token_next_step = min(patch_size, self.block_size - query_token_idx_next_step)
 
             ########## Important: Prepare the tokens ##########
             # [cur_img_0, cur_query_1, ..., cur_query_n, cur_img_n, next_query_0, ..., next_query_m]
@@ -722,7 +723,6 @@ class RandARTransformer(nn.Module):
             x[:, 1 : 2 * num_query_token_cur_step - 1][:, 1::2] = img_tokens[:, 1 : num_query_token_cur_step]
 
             # [next_query_0, ..., next_query_m]
-            query_token_idx_next_step = query_token_idx_cur_step + num_query_token_cur_step
             next_position_instruction_tokens = position_instruction_tokens[:, query_token_idx_next_step : query_token_idx_next_step + num_query_token_next_step]
             x[:, 2 * num_query_token_cur_step - 1 :] = next_position_instruction_tokens
 
