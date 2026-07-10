@@ -665,7 +665,7 @@ class RandARTransformer(nn.Module):
             num_inference_steps = self.block_size
 
         cur_inference_step = 0
-        num_query_token_cur_step = 1 # how many tokens to decode at this step
+        num_query_token_cur_step = 4 # how many tokens to decode at this step
         query_token_idx_cur_step = 0 # the index of the first token to decode at this step
 
         # Step 5-1: Prepare the first step
