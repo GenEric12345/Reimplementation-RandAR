@@ -118,7 +118,16 @@ class Attention(nn.Module):
 
                 keys = torch.cat([cached_k, xk], dim=2)
                 values = torch.cat([cached_v, xv], dim=2)
-                mask = None
+
+                # [CHANGE] Each probed candidate is an independent hypothetical
+                # continuation, not a real sequence — it must attend to the
+                # committed prefix (and itself) but never to sibling
+                # candidates in the same probe batch. mask=None/is_causal=False
+                # previously let candidates fully cross-attend each other.
+                probe_mask = torch.zeros(seqlen, prefix_len + seqlen, dtype=torch.bool, device=x.device)
+                probe_mask[:, :prefix_len] = True
+                probe_mask[:, prefix_len:] = torch.eye(seqlen, dtype=torch.bool, device=x.device)
+                mask = probe_mask.view(1, 1, seqlen, prefix_len + seqlen)
                 is_causal = False
             else:
                 # [b, n_head, max_seq_len, head_dim]
@@ -1065,14 +1074,21 @@ class RandARTransformer(nn.Module):
         # returned a single shared 1-D selection for all images.              #
         # ------------------------------------------------------------------ #
         def probe_and_select(num_to_select: int, step_progress: int) -> torch.Tensor:
-            # unfilled positions per image: [original_bs, num_unfilled]
-            unfilled = (~filled_mask).nonzero(as_tuple=False)  # [N, 2]
+            # [CHANGE] num_unfilled is deterministic: the parallel-decoding
+            # schedule fills the same count for every image each step, and
+            # step_progress is exactly that cumulative count. Computing it
+            # this way (vs. `(~filled_mask).sum(dim=1)[0].item()` +
+            # `assert torch.all(...)`) avoids two GPU->CPU syncs per step.
+            num_unfilled = self.block_size - step_progress
 
-            # This only works cleanly if every image has same num_unfilled
-            num_unfilled = (~filled_mask).sum(dim=1)[0].item()
-            assert torch.all((~filled_mask).sum(dim=1) == num_unfilled)
-
-            unfilled_sel = unfilled[:, 1].view(original_bs, num_unfilled)  # raster indices
+            # [CHANGE] Extract each row's unfilled raster indices (ascending)
+            # without nonzero(), whose output shape is data-dependent and
+            # forces a CUDA sync. Instead, sort raster indices with filled
+            # positions pushed past block_size, so a fixed-size argsort
+            # yields identical ordering to nonzero() but with a static shape.
+            raster_idx = torch.arange(self.block_size, device=cond.device).unsqueeze(0).expand(original_bs, -1)
+            sort_key = raster_idx + filled_mask.long() * self.block_size
+            unfilled_sel = torch.argsort(sort_key, dim=1)[:, :num_unfilled]  # raster indices
 
             # [CHANGE] Probe a random subset of the unfilled positions instead
             # of all of them. Entropy-ranking only needs to beat num_to_select
@@ -1139,6 +1155,9 @@ class RandARTransformer(nn.Module):
             gather_freq(sel_bs)
         ], dim=1)
         input_pos = torch.arange(0, x.shape[1], device=cond.device)
+        # [CHANGE] track the arange start offset in Python so cache_len/next
+        # input_pos can be computed without reading tensor values back to CPU.
+        input_pos_start = 0
 
         # Step 5-2: Start the loop  [SAME loop condition as generate]
         while (query_token_idx_cur_step <= self.block_size - num_query_token_cur_step
@@ -1151,7 +1170,10 @@ class RandARTransformer(nn.Module):
             logits = self.forward_inference(x, cur_freqs_cis, input_pos)
             # [CHANGE] keep cache_len in sync with what's actually been written
             # into the real KV cache by this real (non-probe) forward pass.
-            cache_len = int(input_pos[-1].item()) + 1
+            # input_pos == arange(x.shape[1]) + input_pos_start, so its last
+            # entry + 1 is just input_pos_start + x.shape[1] — computed in
+            # Python instead of a `.item()` GPU->CPU sync.
+            cache_len = input_pos_start + x.shape[1]
 
             # apply CFG  [SAME AS generate]
             if use_cfg:
@@ -1246,10 +1268,14 @@ class RandARTransformer(nn.Module):
             if query_token_idx_cur_step > self.block_size:
                 break
 
-            last_input_pos = input_pos[input_pos.shape[0] - m]
+            # [CHANGE] last_input_pos (== input_pos[-m]) is derivable in Python
+            # as cache_len - m, since input_pos == arange(x.shape[1]) +
+            # input_pos_start and cache_len == input_pos_start + x.shape[1].
+            # Avoids indexing the input_pos tensor to build the next one.
+            input_pos_start = cache_len - m + 1
             input_pos = (torch.arange(2 * m - 1 + num_query_token_next_step,
                                       device=cond.device, dtype=torch.long)
-                         + last_input_pos + 1)
+                         + input_pos_start)
             num_query_token_cur_step = num_query_token_next_step
             cur_sel = next_sel
 
