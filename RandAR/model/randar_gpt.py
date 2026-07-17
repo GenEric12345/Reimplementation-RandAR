@@ -924,6 +924,365 @@ class RandARTransformer(nn.Module):
         result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
         return result_indices
 
+
+    def generate_confidence_last(
+        self,
+        cond: torch.Tensor,
+        token_order: torch.Tensor,
+        cfg_scales: Tuple[float, float] = (1.0, 1.0),
+        num_inference_steps: int = 88,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        probe_candidate_multiplier: int = 4,
+        probe_min_candidates: int = 32,
+    ):
+        """Like generate(), but at each parallel-decoding step each image
+        independently selects its num_query_token_cur_step unfilled positions
+        with lowest predictive entropy (highest confidence).
+
+        At each step a single parallel forward pass (no KV cache) is run over
+        [committed_context, probed_candidates] to obtain per-image entropy for
+        a random subset of the still-unfilled raster positions; each image
+        then picks its own top-K lowest-entropy slots from that subset. The
+        candidate subset has size min(num_unfilled, max(num_to_select *
+        probe_candidate_multiplier, probe_min_candidates)), so early steps
+        (where num_unfilled is close to block_size but only a handful of
+        tokens are being committed) probe a small sample instead of every
+        remaining position. The commit forward pass mirrors generate()
+        exactly.  token_order is ignored.
+
+        Returns:
+            result_indices: [bsz, block_size] sampled tokens in raster order.
+        """
+        bs = cond.shape[0]
+        ###Creating token order just as a test:
+        # Step-1: Generate the token orders and result sequences
+        if token_order is None:
+            token_order = torch.arange(self.block_size, device=cond.device)
+            token_order = token_order.unsqueeze(0).repeat(bs, 1)
+            token_order = token_order.contiguous()
+            if self.position_order == "random":
+                for i in range(bs):
+                    token_order[i] = token_order[i][torch.randperm(self.block_size)]
+            token_order = token_order.contiguous()
+        else:
+            assert token_order.shape == (bs, self.block_size)
+
+
+        bs = cond.shape[0]
+        original_bs = bs  # [CHANGE] keep original bs before CFG doubling
+
+        # ------------------------------------------------------------------ #
+        # [CHANGE] Step-1: Pre-compute pos_instrs and freqs for ALL raster   #
+        # positions so any position can be probed or committed in any order.  #
+        # generate() pre-computes these only for the fixed token_order.       #
+        # ------------------------------------------------------------------ #
+        raster_order   = torch.arange(self.block_size, device=cond.device).unsqueeze(0).repeat(bs, 1)
+        all_pos_instrs = self.get_position_instruction_tokens(raster_order)          # [bs, block_size, dim]
+        all_img_freqs  = (self.freqs_cis[self.cls_token_num:]
+                          .clone().to(cond.device)
+                          .unsqueeze(0).repeat(bs, 1, 1, 1))                         # [bs, block_size, h/2, 2]
+
+        # [CHANGE] store tokens directly at raster positions; no end-reorder needed
+        result_indices = torch.zeros((bs, self.block_size), dtype=torch.long, device=cond.device)
+
+        # [CHANGE] per-image filled mask: [original_bs, block_size]
+        # BUG FIX: previously [block_size] — shared across all images, forcing
+        # every image to follow the same fill order.
+        filled_mask = torch.zeros(original_bs, self.block_size, dtype=torch.bool, device=cond.device)
+
+        # Step-3: Prepare CFG  [SAME AS generate]
+        use_cfg = cfg_scales[-1] > 1.0
+        if use_cfg:
+            cond_null     = torch.ones_like(cond) * self.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+            # [CHANGE] double the all-raster arrays (generate() doubled token_order-indexed arrays)
+            all_img_freqs  = torch.cat([all_img_freqs,  all_img_freqs],  dim=0)
+            all_pos_instrs = torch.cat([all_pos_instrs, all_pos_instrs], dim=0)
+            bs *= 2
+        else:
+            cond_combined = cond
+        cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
+
+        # Step-4: KV Cache setup  [SAME AS generate]
+        max_seq_len = cond_combined_tokens.shape[1] + self.block_size * 2
+        with torch.device(cond.device):
+            self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len,
+                              dtype=self.tok_embeddings.weight.dtype)
+
+        # Step-5: parallel decoding schedule  [SAME AS generate]
+        if num_inference_steps == -1:
+            num_inference_steps = self.block_size
+
+        cur_inference_step       = 0
+        num_query_token_cur_step = 1
+        query_token_idx_cur_step = 0
+
+        # [CHANGE] committed_ctx / committed_freqs: maintained explicitly for probe passes.
+        # In generate() this state lives only implicitly inside the KV cache.
+        committed_ctx   = cond_combined_tokens                                             # [bs, cls_token_num, dim]
+        committed_freqs = self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1)
+
+        ### Prime the cache with conditional tokens BEFORE the first probe pass,
+        ### so probe_and_select never reads uninitialized cache slots.
+        cond_freqs = self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1)
+        cond_pos = torch.arange(self.cls_token_num, device=cond.device)
+        _ = self.forward_inference(cond_combined_tokens, cond_freqs, cond_pos)
+
+        # [CHANGE] cache_len tracks how many entries are actually physically
+        # written into the real KV cache (as opposed to committed_ctx.shape[1],
+        # which includes the current step's img-token half before it's been
+        # committed via a real forward_inference call). BUG FIX: probe_and_select
+        # used to read committed_ctx.shape[1] as prefix_len, which is ahead of
+        # the real cache by the previous step's chunk size, so probes attended
+        # to uninitialized (zero) cache slots for the tail of the context.
+        cache_len = self.cls_token_num
+
+        # ------------------------------------------------------------------ #
+        # [CHANGE] Per-image gather helpers.                                  #
+        # sel_bs has shape [bs, m] (per-image raster indices, CFG-doubled).  #
+        # All lookups into all_pos_instrs / all_img_freqs use torch.gather   #
+        # instead of plain indexing so each image selects its own positions.  #
+        # BUG FIX: previously used shared 1-D cur_sel to index all images    #
+        # identically, e.g. all_pos_instrs[:, cur_sel].                      #
+        # ------------------------------------------------------------------ #
+        freq_h, freq_w = self.freqs_cis.shape[-2], self.freqs_cis.shape[-1]
+
+        def gather_pos(sel_bs):
+            # sel_bs: [bs, m] → [bs, m, dim]
+            return torch.gather(all_pos_instrs, 1,
+                                sel_bs.unsqueeze(-1).expand(-1, -1, self.dim))
+
+        def gather_freq(sel_bs):
+            # sel_bs: [bs, m] → [bs, m, freq_h, freq_w]
+            return torch.gather(all_img_freqs, 1,
+                                sel_bs.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, freq_h, freq_w))
+
+        def to_bs(sel):
+            # sel: [original_bs, m] → [bs, m] (duplicate for CFG, identity otherwise)
+            # BUG FIX: CFG doubling was missing for per-image sel tensors.
+            return torch.cat([sel, sel], dim=0) if use_cfg else sel
+
+        # ------------------------------------------------------------------ #
+        # [CHANGE] probe_and_select: one parallel forward pass (no KV cache)  #
+        # over [committed_ctx, all_pos_instrs], then per-image entropy over   #
+        # all block_size positions.  Each image independently selects its     #
+        # num_to_select lowest-entropy UNFILLED positions.                    #
+        # Returns sel: [original_bs, num_to_select] raster indices.          #
+        #                                                                     #
+        # BUG FIX: previously averaged entropy across images (mean_H) and    #
+        # returned a single shared 1-D selection for all images.              #
+        # ------------------------------------------------------------------ #
+        def probe_and_select(num_to_select: int, step_progress: int) -> torch.Tensor:
+            # [CHANGE] num_unfilled is deterministic: the parallel-decoding
+            # schedule fills the same count for every image each step, and
+            # step_progress is exactly that cumulative count. Computing it
+            # this way (vs. `(~filled_mask).sum(dim=1)[0].item()` +
+            # `assert torch.all(...)`) avoids two GPU->CPU syncs per step.
+            num_unfilled = self.block_size - step_progress
+
+            # [CHANGE] Extract each row's unfilled raster indices (ascending)
+            # without nonzero(), whose output shape is data-dependent and
+            # forces a CUDA sync. Instead, sort raster indices with filled
+            # positions pushed past block_size, so a fixed-size argsort
+            # yields identical ordering to nonzero() but with a static shape.
+            raster_idx = torch.arange(self.block_size, device=cond.device).unsqueeze(0).expand(original_bs, -1)
+            sort_key = raster_idx + filled_mask.long() * self.block_size
+            unfilled_sel = torch.argsort(sort_key, dim=1)[:, :num_unfilled]  # raster indices
+
+            # [CHANGE] Probe a random subset of the unfilled positions instead
+            # of all of them. Entropy-ranking only needs to beat num_to_select
+            # winners, so scoring every remaining position is wasted work,
+            # especially early in the cosine decode schedule where
+            # num_unfilled stays close to block_size for many steps while
+            # num_to_select is still small. Falls back to the full unfilled
+            # set once it's already <= the candidate budget (e.g. late steps).
+            num_candidates = min(
+                num_unfilled,
+                max(num_to_select * probe_candidate_multiplier, probe_min_candidates),
+            )
+            if num_candidates < num_unfilled:
+                rand_scores = torch.rand(original_bs, num_unfilled, device=cond.device)
+                cand_local = torch.topk(rand_scores, num_candidates, dim=1, largest=False).indices
+                candidate_sel = torch.gather(unfilled_sel, 1, cand_local)  # [original_bs, num_candidates]
+            else:
+                candidate_sel = unfilled_sel
+
+            # duplicate for CFG if needed: [bs, num_candidates]
+            candidate_sel_bs = to_bs(candidate_sel)
+
+            probe_pos   = gather_pos(candidate_sel_bs)
+            probe_freqs_only = gather_freq(candidate_sel_bs)
+            prefix_len = cache_len
+
+            probe_logits = self.forward_probe_from_cache(probe_pos, probe_freqs_only, prefix_len=prefix_len)
+
+            if use_cfg:
+                cur_cfg = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * step_progress / self.block_size
+                cond_log, uncond_log = torch.chunk(probe_logits, 2, dim=0)
+                ent_logits = uncond_log + cur_cfg * (cond_log - uncond_log)
+            else:
+                ent_logits = probe_logits
+
+            probs = torch.softmax(ent_logits, dim=-1)
+            entropy = -(probs * torch.log(probs.clamp(min=1e-10))).sum(dim=-1)
+            # entropy: [original_bs, num_candidates]
+
+            _, local_topk = torch.topk(entropy, num_to_select, dim=1, largest=True)
+            topk_H = torch.gather(entropy, 1, local_topk)
+            local_sel = torch.gather(local_topk, 1, torch.argsort(topk_H, dim=1))
+
+            # map local candidate indices back to raster positions
+            sel = torch.gather(candidate_sel, 1, local_sel)  # [original_bs, num_to_select]
+            return sel
+
+        # ------------------------------------------------------------------ #
+        # [CHANGE] Step 5-1: per-image probe to select the first position.   #
+        # generate() uses position_instruction_tokens[:, 0] for every image. #
+        # ------------------------------------------------------------------ #
+        ###Switch to token order to isolate fid problem
+        cur_sel = probe_and_select(num_query_token_cur_step, query_token_idx_cur_step)
+        #cur_sel = token_order[:, query_token_idx_cur_step: query_token_idx_cur_step + num_query_token_cur_step]
+        # cur_sel: [original_bs, 1]
+        filled_mask.scatter_(1, cur_sel, True)
+
+        sel_bs = to_bs(cur_sel)  # [bs, 1]
+        x = torch.cat([cond_combined_tokens, gather_pos(sel_bs)], dim=1)
+        ###The :self.cls_token_num is the same since its irrespective of token order
+        ###The gather_freq(sel_bs) gets the img_freq for the next token order selection.
+        cur_freqs_cis = torch.cat([
+            self.freqs_cis[:self.cls_token_num].unsqueeze(0).repeat(bs, 1, 1, 1),
+            gather_freq(sel_bs)
+        ], dim=1)
+        input_pos = torch.arange(0, x.shape[1], device=cond.device)
+        # [CHANGE] track the arange start offset in Python so cache_len/next
+        # input_pos can be computed without reading tensor values back to CPU.
+        input_pos_start = 0
+
+        # Step 5-2: Start the loop  [SAME loop condition as generate]
+        while (query_token_idx_cur_step <= self.block_size - num_query_token_cur_step
+               and query_token_idx_cur_step <= self.block_size - 1):
+
+            k = query_token_idx_cur_step
+            m = num_query_token_cur_step
+
+            # Step 5-3: commit forward pass  [SAME AS generate]
+            logits = self.forward_inference(x, cur_freqs_cis, input_pos)
+            # [CHANGE] keep cache_len in sync with what's actually been written
+            # into the real KV cache by this real (non-probe) forward pass.
+            # input_pos == arange(x.shape[1]) + input_pos_start, so its last
+            # entry + 1 is just input_pos_start + x.shape[1] — computed in
+            # Python instead of a `.item()` GPU->CPU sync.
+            cache_len = input_pos_start + x.shape[1]
+
+            # apply CFG  [SAME AS generate]
+            if use_cfg:
+                cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * k / self.block_size
+                cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
+                logits = uncond_logits + cur_cfg_scale * (cond_logits - uncond_logits)
+
+            # query tokens' logits and indices  [SAME AS generate]
+            logits  = logits[:, -m:]  # [original_bs, m, vocab]
+            indices = torch.zeros(original_bs, m, dtype=torch.long, device=cond.device)
+            for i in range(m):
+                indices[:, i:i+1] = sample(logits[:, i:i+1],
+                                           temperature=temperature, top_k=top_k, top_p=top_p)[0]
+
+            # [CHANGE] scatter per-image: result_indices[b, cur_sel[b, i]] = indices[b, i]
+            # BUG FIX: previously looped over a shared 1-D cur_sel and wrote the
+            # same column for every image.
+            result_indices.scatter_(1, cur_sel, indices)
+
+            img_tokens = self.tok_embeddings(indices)  # [original_bs, m, dim]
+            if use_cfg:
+                img_tokens = torch.cat([img_tokens, img_tokens], dim=0)
+
+            # [CHANGE] update committed_ctx with interleaved [pos_instr_sel, img] pairs.
+            # Uses per-image gather so each row reflects that image's actual selections.
+            sel_bs_cur = to_bs(cur_sel)  # [bs, m]
+            chunk_ctx   = torch.zeros(bs, 2 * m, self.dim,
+                                      dtype=committed_ctx.dtype, device=cond.device)
+            chunk_freqs = torch.zeros(bs, 2 * m, freq_h, freq_w,
+                                      dtype=committed_freqs.dtype, device=cond.device)
+            chunk_ctx[:, ::2]    = gather_pos(sel_bs_cur)
+            chunk_ctx[:, 1::2]   = img_tokens
+            chunk_freqs[:, ::2]  = gather_freq(sel_bs_cur)
+            chunk_freqs[:, 1::2] = gather_freq(sel_bs_cur)
+            committed_ctx   = torch.cat([committed_ctx,   chunk_ctx],   dim=1)
+            committed_freqs = torch.cat([committed_freqs, chunk_freqs], dim=1)
+
+            # Step 5-4: Prepare for the next step  [SAME AS generate]
+            cur_inference_step += 1
+            num_query_token_next_step = calculate_num_query_tokens_for_parallel_decoding(
+                cur_inference_step, num_inference_steps, self.block_size, k, m)
+
+            query_token_idx_next_step = k + m
+
+            # [CHANGE] per-image probe to select the next batch of positions
+            if query_token_idx_next_step < self.block_size and num_query_token_next_step > 0:
+                #To isolate the issue CHANGE BACK LATER
+                next_sel = probe_and_select(num_query_token_next_step, query_token_idx_next_step)
+                #next_sel = token_order[:, query_token_idx_next_step: query_token_idx_next_step + num_query_token_next_step]
+                # next_sel: [original_bs, m_next]
+                filled_mask.scatter_(1, next_sel, True)
+            else:
+                next_sel = torch.empty(original_bs, 0, dtype=torch.long, device=cond.device)
+
+            ########## Important: Prepare the tokens ##########
+            # [SAME structure as generate; gathering per-image via gather_pos
+            #  instead of token_order slices into position_instruction_tokens]
+            x = torch.zeros(bs, 2 * m - 1 + num_query_token_next_step, self.dim,
+                            dtype=x.dtype, device=cond.device)
+
+            # cur_img_0  [SAME]
+            x[:, :1] = img_tokens[:, :1]
+
+            # [cur_query_1, ..., cur_query_m-1]  [CHANGE]
+            if m > 1:
+                x[:, 1:2*m-1][:, ::2]  = gather_pos(to_bs(cur_sel[:, 1:]))
+                x[:, 1:2*m-1][:, 1::2] = img_tokens[:, 1:m]
+
+            # [next_query_0, ..., next_query_m_next-1]  [CHANGE]
+            if num_query_token_next_step > 0:
+                x[:, 2*m-1:] = gather_pos(to_bs(next_sel))
+
+            ########## Important: Prepare the freqs_cis ##########
+            # [SAME structure as generate; same gather-based index change]
+            cur_freqs_cis = torch.zeros((bs, 2 * m - 1 + num_query_token_next_step, freq_h, freq_w),
+                                        dtype=cur_freqs_cis.dtype, device=cond.device)
+
+            # cur_img_0  [CHANGE]
+            cur_freqs_cis[:, :1] = gather_freq(to_bs(cur_sel[:, :1]))
+
+            # [cur_query_1, ..., cur_query_m-1]  [CHANGE]
+            if m > 1:
+                cur_freqs_cis[:, 1:2*m-1][:, ::2]  = gather_freq(to_bs(cur_sel[:, 1:]))
+                cur_freqs_cis[:, 1:2*m-1][:, 1::2] = gather_freq(to_bs(cur_sel[:, 1:]))
+
+            # [next_query_0, ..., next_query_m_next-1]  [CHANGE]
+            if num_query_token_next_step > 0:
+                cur_freqs_cis[:, 2*m-1:] = gather_freq(to_bs(next_sel))
+
+            # Step 5-5: Move the query pointer idx  [SAME AS generate]
+            query_token_idx_cur_step = query_token_idx_next_step
+            if query_token_idx_cur_step > self.block_size:
+                break
+
+            # [CHANGE] last_input_pos (== input_pos[-m]) is derivable in Python
+            # as cache_len - m, since input_pos == arange(x.shape[1]) +
+            # input_pos_start and cache_len == input_pos_start + x.shape[1].
+            # Avoids indexing the input_pos tensor to build the next one.
+            input_pos_start = cache_len - m + 1
+            input_pos = (torch.arange(2 * m - 1 + num_query_token_next_step,
+                                      device=cond.device, dtype=torch.long)
+                         + input_pos_start)
+            num_query_token_cur_step = num_query_token_next_step
+            cur_sel = next_sel
+
+        # Step 6: result_indices already in raster order  [CHANGE: no argsort/gather needed]
+        return result_indices
+
     def generate_confidence_first(
         self,
         cond: torch.Tensor,
