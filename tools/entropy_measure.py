@@ -246,7 +246,8 @@ if __name__ == "__main__":
 
     # Weights & Biases
     parser.add_argument("--wandb-project", type=str, default="RandAR_Visuals")
-    parser.add_argument("--wandb-entity", type=str, default="ericyee07")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+                        help="wandb entity to log to (default: your account's default entity)")
     parser.add_argument("--wandb-offline", action="store_true")
 
     args = parser.parse_args()
