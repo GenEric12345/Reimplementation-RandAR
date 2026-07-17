@@ -215,7 +215,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Model / checkpoint
-    parser.add_argument("--config", type=str, default="configs/randar/randar_xl_0.7b.yaml")
+    parser.add_argument("--config", type=str, default="configs/randar/randar_l_0.3b_llamagen.yaml")
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--gpt-ckpt", type=str, default=None)
     parser.add_argument("--vq-ckpt", type=str, default=None, help="ckpt path for vq model")
@@ -245,8 +245,8 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="./results/entropy_measure")
 
     # Weights & Biases
-    parser.add_argument("--wandb-project", type=str, default="RandAR-Release")
-    parser.add_argument("--wandb-entity", type=str, default="RandAR")
+    parser.add_argument("--wandb-project", type=str, default="RandAR_Visuals")
+    parser.add_argument("--wandb-entity", type=str, default="ericyee07")
     parser.add_argument("--wandb-offline", action="store_true")
 
     args = parser.parse_args()
