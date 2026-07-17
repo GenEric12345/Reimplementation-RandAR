@@ -656,7 +656,7 @@ def generate_ordering(c_indices, cfg_scales, runs, gpt_model, args):
     """
     entropys = []
     for _ in range(runs):
-        indices, entropy = gpt_model.generate_with_entropy(
+        indices, entropy, _step = gpt_model.generate_with_entropy(
             cond=c_indices,
             token_order=None,
             cfg_scales=cfg_scales,

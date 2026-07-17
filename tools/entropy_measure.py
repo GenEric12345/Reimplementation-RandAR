@@ -1,13 +1,20 @@
 
-""" Measure and visualize per-cell decoding confidence (entropy) under confidence-first
-    decoding, as a function of decode step.
+""" Measure and visualize per-cell decoding confidence (entropy) as a function of decode step,
+    under either confidence-first decoding or standard (fixed-schedule) decoding.
 
     For each generated image, this records the entropy of the model's predictive
-    distribution at the moment each raster cell was committed (via
-    gpt_model.generate_with_confidence), and logs an aggregated
-    entropy-vs-decode-step plot to Weights & Biases. No FID computation and no
-    CFG-scale search are performed here; images and per-image entropy/step
-    arrays are also saved to disk for later inspection.
+    distribution at the moment each raster cell was committed, along with the
+    parallel-decoding step that committed it. --decode-mode selects the
+    generation routine used: "confidence" (default) uses
+    gpt_model.generate_with_confidence, whose decode order is chosen adaptively
+    by per-step confidence; "standard" uses gpt_model.generate_with_entropy,
+    which follows the model's normal fixed parallel-decoding schedule (token
+    order taken from the model's own position_order config, e.g. a random
+    permutation), useful for entropy-vs-step plots of plain random-order
+    generation. Either way, an aggregated entropy-vs-decode-step plot is logged
+    to Weights & Biases. No FID computation and no CFG-scale search are
+    performed here; images and per-image entropy/step arrays are also saved to
+    disk for later inspection.
 
     Structured as a single-GPU/single-process script (mirrors
     visualizer/generate_images.py) since this is a qualitative/diagnostic run
@@ -103,6 +110,7 @@ def main(args):
     metadata = {
         "exp_name": args.exp_name,
         "ckpt": ckpt_string_name,
+        "decode_mode": args.decode_mode,
         "cfg_scale": args.cfg_scale,
         "block_size": block_size,
         "image_size_eval": args.image_size_eval,
@@ -128,17 +136,31 @@ def main(args):
 
         print(f"\n[Batch {batch_i+1}/{num_batches}] Classes: {batch_classes}")
 
-        result_indices, result_entropy, result_step = gpt_model.generate_with_confidence(
-            cond=c_indices,
-            token_order=None,
-            cfg_scales=cfg_scales,
-            num_inference_steps=args.num_inference_steps,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            probe_candidate_multiplier=args.probe_candidate_multiplier,
-            probe_min_candidates=args.probe_min_candidates,
-        )
+        if args.decode_mode == "confidence":
+            result_indices, result_entropy, result_step = gpt_model.generate_with_confidence(
+                cond=c_indices,
+                token_order=None,
+                cfg_scales=cfg_scales,
+                num_inference_steps=args.num_inference_steps,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                probe_candidate_multiplier=args.probe_candidate_multiplier,
+                probe_min_candidates=args.probe_min_candidates,
+            )
+        else:
+            # "standard": fixed decode schedule (token order comes from the
+            # model's own position_order config, e.g. a random permutation),
+            # rather than confidence-driven adaptive ordering.
+            result_indices, result_entropy, result_step = gpt_model.generate_with_entropy(
+                cond=c_indices,
+                token_order=None,
+                cfg_scales=cfg_scales,
+                num_inference_steps=args.num_inference_steps,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+            )
 
         images = tokenizer.decode_codes_to_img(result_indices, args.image_size_eval)
 
@@ -231,6 +253,12 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
     parser.add_argument("--probe-candidate-multiplier", type=int, default=4)
     parser.add_argument("--probe-min-candidates", type=int, default=32)
+    parser.add_argument("--decode-mode", type=str, default="confidence", choices=["confidence", "standard"],
+                        help="'confidence' uses generate_with_confidence (adaptive, confidence-first decode "
+                             "order; the two --probe-* args apply here). 'standard' uses generate_with_entropy "
+                             "(fixed parallel-decoding schedule with the token order coming from the model's "
+                             "own position_order config, e.g. a random permutation) to get entropy-vs-step "
+                             "plots for plain random-order generation.")
 
     # What to generate
     parser.add_argument("--class-labels", type=str, default=None,

@@ -2297,11 +2297,14 @@ class RandARTransformer(nn.Module):
         top_k: int = 0,
         top_p: float = 1.0,
     ):
-        """ Same as generate, but also returns the per-token entropy of the post-CFG logits.
+        """ Same as generate, but also returns the per-token entropy of the post-CFG logits
+        and the parallel-decoding step at which each raster cell was committed.
 
         Returns:
             result_indices: [bsz, block_size] sampled token indices in raster order
             result_entropy: [bsz, block_size] entropy (in nats) of the logit distribution, in raster order
+            result_step: [bsz, block_size] the parallel-decoding step index (0-based) at
+                which each cell was committed, in raster order.
         """
         bs = cond.shape[0]
 
@@ -2319,6 +2322,8 @@ class RandARTransformer(nn.Module):
 
         result_indices = torch.zeros((bs, self.block_size), dtype=torch.long, device=cond.device)
         result_entropy = torch.zeros((bs, self.block_size), dtype=torch.float, device=cond.device)
+        # [ADDED] step index (0-based) at which each token-order position was committed.
+        result_step = torch.zeros((bs, self.block_size), dtype=torch.long, device=cond.device)
 
         # Step-2: Prepare the freqs_cis and position_instruction_tokens
         position_instruction_tokens = self.get_position_instruction_tokens(token_order)
@@ -2375,6 +2380,8 @@ class RandARTransformer(nn.Module):
             probs = torch.softmax(logits, dim=-1)
             token_entropy = -(probs * torch.log(probs.clamp(min=1e-10))).sum(dim=-1)
             result_entropy[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step] = token_entropy
+            # [ADDED] record which parallel-decoding step committed this chunk of positions.
+            result_step[:, query_token_idx_cur_step : query_token_idx_cur_step + num_query_token_cur_step] = cur_inference_step
 
             indices = torch.zeros(result_indices.shape[0], num_query_token_cur_step, dtype=torch.long, device=cond.device)
             for i in range(num_query_token_cur_step):
@@ -2434,7 +2441,8 @@ class RandARTransformer(nn.Module):
         reverse_permutation = torch.argsort(token_order, dim=-1).long().unsqueeze(-1).expand(-1, -1, 1)
         result_indices = torch.gather(result_indices.unsqueeze(-1), 1, reverse_permutation).squeeze(-1)
         result_entropy = torch.gather(result_entropy, 1, reverse_permutation.squeeze(-1))
-        return result_indices, result_entropy
+        result_step = torch.gather(result_step, 1, reverse_permutation.squeeze(-1))
+        return result_indices, result_entropy, result_step
 
     def generate_with_attention(
         self,
